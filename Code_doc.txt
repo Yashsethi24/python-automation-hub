@@ -1,20 +1,9 @@
-import win32com.client as win32
+def list_all_folders(folder, level=0):
+    print("  " * level + folder.Name)
+    for f in folder.Folders:
+        list_all_folders(f, level + 1)
 
-OL_FOLDER_INBOX = 6
-
-def get_folder_path(folder_path):
-    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
-    ns = outlook.Session
-    root = ns.GetDefaultFolder(OL_FOLDER_INBOX).Parent
-    current = root
-    for seg in folder_path.split("/"):
-        seg = seg.strip()
-        if not seg:
-            continue
-        current = current.Folders(seg)
-    return current
-
-# Test
-folder = get_folder_path("Inbox/MBNA test")
-print("Folder found:", folder.Name)
-print("Number of items:", folder.Items.Count)
+outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+ns = outlook.Session
+root = ns.GetDefaultFolder(6).Parent  # mailbox root
+list_all_folders(root)
