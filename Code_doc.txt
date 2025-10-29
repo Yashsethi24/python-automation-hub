@@ -1,6 +1,20 @@
-def list_top_folders():
+import win32com.client as win32
+
+OL_FOLDER_INBOX = 6
+
+def get_folder_path(folder_path):
     outlook = win32.gencache.EnsureDispatch("Outlook.Application")
     ns = outlook.Session
     root = ns.GetDefaultFolder(OL_FOLDER_INBOX).Parent
-    for f in root.Folders:
-        print(f.Name)
+    current = root
+    for seg in folder_path.split("/"):
+        seg = seg.strip()
+        if not seg:
+            continue
+        current = current.Folders(seg)
+    return current
+
+# Test
+folder = get_folder_path("Inbox/MBNA test")
+print("Folder found:", folder.Name)
+print("Number of items:", folder.Items.Count)
