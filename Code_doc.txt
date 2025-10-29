@@ -1,0 +1,6 @@
+def list_top_folders():
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    ns = outlook.Session
+    root = ns.GetDefaultFolder(OL_FOLDER_INBOX).Parent
+    for f in root.Folders:
+        print(f.Name)
