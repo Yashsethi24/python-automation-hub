@@ -1,9 +1,65 @@
-def list_all_folders(folder, level=0):
-    print("  " * level + folder.Name)
-    for f in folder.Folders:
-        list_all_folders(f, level + 1)
+import win32com.client as win32
 
-outlook = win32.gencache.EnsureDispatch("Outlook.Application")
-ns = outlook.Session
-root = ns.GetDefaultFolder(6).Parent  # mailbox root
-list_all_folders(root)
+OL_FOLDER_INBOX     = 6
+OL_FOLDER_SENTMAIL  = 5
+
+def _list_child_names(fld):
+    return [f.Name for f in fld.Folders]
+
+def resolve_folder_path(ns, path: str):
+    """
+    Resolve a folder by path within the *default mailbox*.
+    Examples:
+      "Inbox"
+      "Sent Items"
+      "Inbox/MBNA test"
+      "Inbox/Reports/2025 Q4"
+    Handles case differences and stray spaces.
+    Raises a descriptive error if any segment isn't found.
+    """
+    # Start at mailbox root (parent of Inbox)
+    root = ns.GetDefaultFolder(OL_FOLDER_INBOX).Parent
+    current = root
+
+    # normalize and split
+    segments = [seg.strip() for seg in path.split("/") if seg.strip()]
+    if not segments:
+        raise ValueError("Empty folder path.")
+
+    # Special-case well-known roots to avoid localized names mismatch
+    first = segments[0].lower()
+    if first in ("inbox",):
+        current = ns.GetDefaultFolder(OL_FOLDER_INBOX)
+        segments = segments[1:]  # we already moved into Inbox
+    elif first in ("sent", "sent items"):
+        current = ns.GetDefaultFolder(OL_FOLDER_SENTMAIL)
+        segments = segments[1:]
+    else:
+        # Look up the first segment under mailbox root
+        cand = None
+        for f in current.Folders:
+            if f.Name.strip().lower() == first:
+                cand = f; break
+        if cand is None:
+            raise LookupError(
+                f"Could not find top-level folder '{segments[0]}' under mailbox root.\n"
+                f"Available top-level folders: {', '.join(_list_child_names(current))}"
+            )
+        current = cand
+        segments = segments[1:]
+
+    # Walk remaining segments
+    for seg in segments:
+        target = None
+        wanted = seg.strip().lower()
+        for f in current.Folders:
+            if f.Name.strip().lower() == wanted:
+                target = f; break
+        if target is None:
+            raise LookupError(
+                f"Could not find subfolder '{seg}' under '{current.Name}'.\n"
+                f"Siblings here: {', '.join(_list_child_names(current))}"
+            )
+        current = target
+
+    return current
