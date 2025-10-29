@@ -63,3 +63,41 @@ def resolve_folder_path(ns, path: str):
         current = target
 
     return current
+
+
+
+def reply_in_thread_with_attachment(subject_hint, attachment_path, reply_all=True, folder="Inbox/MBNA test"):
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    ns = outlook.Session
+
+    target_folder = resolve_folder_path(ns, folder)
+    # now search & reply inside target_folder
+    import datetime as dt
+    cutoff = (dt.datetime.now() - dt.timedelta(days=60)).strftime("%m/%d/%Y %I:%M %p")
+    items = target_folder.Items.Restrict(f"[SentOn] >= '{cutoff}' or [ReceivedTime] >= '{cutoff}'")
+    items.Sort("[SentOn]", True)
+
+    anchor = None
+    hint = (subject_hint or "").lower()
+    for it in items:
+        if getattr(it, "Class", None) == 43 and hint in ((it.Subject or "").lower()):
+            anchor = it; break
+
+    if not anchor:
+        raise RuntimeError(f"No recent message found with subject containing {subject_hint!r} in {folder!r}")
+
+    reply = anchor.ReplyAll() if reply_all else anchor.Reply()
+    reply.Sensitivity = 3  # olConfidential
+    try:
+        reply.Permission = 2  # olDoNotForward (IRM-enabled tenants only)
+    except Exception:
+        pass
+
+    reply.Subject  = f"[Restricted] {reply.Subject}"
+    reply.HTMLBody = "<p>Attaching the latest report. Please keep internal.</p>" + reply.HTMLBody
+
+    t = reply.UserProperties.Add("TITUSAutomatedClassification", 1)
+    t.Value = "TLPropertyRoot=ABCDE;Classification=For internal use only; Registered to:My Companies;"
+
+    reply.Attachments.Add(attachment_path)
+    reply.Send()
