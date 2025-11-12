@@ -1,0 +1,281 @@
+-- 1A) Helpers: simple normalizations you can reuse anywhere
+CREATE OR ALTER VIEW Risk.vw_app_base AS
+SELECT
+    A.app_id,
+    CAST(A.app_dt AS date) AS app_date,
+    A.app_dt,
+    UPPER(LTRIM(RTRIM(A.first_name)))  AS first_name_u,
+    UPPER(LTRIM(RTRIM(A.last_name)))   AS last_name_u,
+    UPPER(LTRIM(RTRIM(A.address1)))    AS address1_u,
+    UPPER(LTRIM(RTRIM(A.city)))        AS city_u,
+    UPPER(LTRIM(RTRIM(A.state)))       AS state_u,
+    UPPER(LTRIM(RTRIM(A.postal_code))) AS postal_u,
+    -- keep only digits in phone; handle leading country codes
+    CASE 
+      WHEN LEN(REPLACE(A.phone, ' ', '')) >= 10 
+      THEN RIGHT(
+           REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(A.phone,'-',''),' ',''),'(',''),')',''),'+','')
+         , 10)
+      ELSE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(A.phone,'-',''),' ',''),'(',''),')',''),'+','')
+    END AS phone_norm,
+    UPPER(LTRIM(RTRIM(A.email))) AS email_u,
+    A.ip_address,
+    TRY_CONVERT(varchar(15), A.ip_address) AS ip4_txt, -- if stored as text already, this is a no-op
+    SOUNDEX(A.first_name) AS sx_first,
+    SOUNDEX(A.last_name)  AS sx_last,
+    A.true_fraud_ind
+FROM Risk.dbo.Applications A;
+GO
+
+
+CREATE OR ALTER VIEW Risk.vw_app_entity_freq AS
+WITH B AS (SELECT * FROM Risk.vw_app_base)
+SELECT
+    B.app_id,
+    B.app_dt,
+    B.app_date,
+    -- Phone reuse (30/90d)
+    COUNT(*) OVER (
+      PARTITION BY B.phone_norm
+      ORDER BY B.app_dt
+      RANGE BETWEEN INTERVAL '30' DAY PRECEDING AND CURRENT ROW
+    ) AS phone_apps_30d,
+    COUNT(*) OVER (
+      PARTITION BY B.phone_norm
+      ORDER BY B.app_dt
+      RANGE BETWEEN INTERVAL '90' DAY PRECEDING AND CURRENT ROW
+    ) AS phone_apps_90d,
+
+    -- Email reuse
+    COUNT(*) OVER (
+      PARTITION BY B.email_u
+      ORDER BY B.app_dt
+      RANGE BETWEEN INTERVAL '30' DAY PRECEDING AND CURRENT ROW
+    ) AS email_apps_30d,
+
+    -- IP reuse
+    COUNT(*) OVER (
+      PARTITION BY B.ip4_txt
+      ORDER BY B.app_dt
+      RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND CURRENT ROW
+    ) AS ip_apps_7d,
+    COUNT(*) OVER (
+      PARTITION BY B.ip4_txt
+      ORDER BY B.app_dt
+      RANGE BETWEEN INTERVAL '30' DAY PRECEDING AND CURRENT ROW
+    ) AS ip_apps_30d,
+
+    -- Address reuse (coarse: address1 + postal)
+    COUNT(*) OVER (
+      PARTITION BY B.address1_u, B.postal_u
+      ORDER BY B.app_dt
+      RANGE BETWEEN INTERVAL '90' DAY PRECEDING AND CURRENT ROW
+    ) AS addr_apps_90d,
+
+    -- Name-similarity (SOUNDEX pair) reuse
+    COUNT(*) OVER (
+      PARTITION BY B.sx_first, B.sx_last, B.postal_u
+      ORDER BY B.app_dt
+      RANGE BETWEEN INTERVAL '180' DAY PRECEDING AND CURRENT ROW
+    ) AS name_postal_apps_180d
+FROM B;
+GO
+
+
+CREATE OR ALTER VIEW Risk.vw_card_agg_per_app AS
+SELECT
+    C.app_id,
+    COUNT(*)                           AS card_cnt,
+    COUNT(DISTINCT C.bin)              AS bin_distinct_cnt,
+    COUNT(DISTINCT C.last4)            AS last4_distinct_cnt,
+    MIN(C.opened_dt)                   AS first_card_open_dt,
+    MAX(C.opened_dt)                   AS last_card_open_dt,
+    SUM(CASE WHEN C.status='ACTIVE' THEN 1 ELSE 0 END) AS active_card_cnt,
+    SUM(CASE WHEN C.status='CLOSED' THEN 1 ELSE 0 END) AS closed_card_cnt,
+    -- product skew: percent of dominant product among cards in app
+    CAST(
+      1.0 * MAX(COUNT(*)) OVER (PARTITION BY C.app_id, C.product)
+      / NULLIF(COUNT(*) OVER (PARTITION BY C.app_id),0)
+      AS decimal(9,4)
+    ) AS max_product_share
+FROM CardsDB.dbo.Cards C
+GROUP BY C.app_id;
+GO
+
+
+CREATE OR ALTER VIEW Risk.vw_features_app AS
+SELECT
+    B.app_id,
+    B.app_dt,
+    B.app_date,
+    B.city_u,
+    B.state_u,
+    B.phone_norm,
+    B.email_u,
+    B.ip4_txt,
+    B.true_fraud_ind,
+
+    F.phone_apps_30d,
+    F.phone_apps_90d,
+    F.email_apps_30d,
+    F.ip_apps_7d,
+    F.ip_apps_30d,
+    F.addr_apps_90d,
+    F.name_postal_apps_180d,
+
+    CA.card_cnt,
+    CA.bin_distinct_cnt,
+    CA.last4_distinct_cnt,
+    CA.first_card_open_dt,
+    CA.last_card_open_dt,
+    CA.active_card_cnt,
+    CA.closed_card_cnt,
+    CA.max_product_share
+FROM Risk.vw_app_base B
+LEFT JOIN Risk.vw_app_entity_freq F ON F.app_id = B.app_id
+LEFT JOIN Risk.vw_card_agg_per_app CA ON CA.app_id = B.app_id;
+GO
+
+
+CREATE OR ALTER VIEW Risk.vw_rule_flags AS
+SELECT
+  app_id,
+  app_dt,
+  app_date,
+  city_u, state_u,
+  true_fraud_ind,
+
+  -- Example rules (tune thresholds)
+  CASE WHEN ip_apps_7d >= 5 THEN 1 ELSE 0 END                           AS r_ip_velocity,
+  CASE WHEN phone_apps_30d >= 3 THEN 1 ELSE 0 END                        AS r_phone_reuse,
+  CASE WHEN addr_apps_90d >= 4 THEN 1 ELSE 0 END                         AS r_address_cluster,
+  CASE WHEN card_cnt >= 3 AND bin_distinct_cnt >= 2 THEN 1 ELSE 0 END    AS r_multi_card_multi_bin,
+  CASE WHEN name_postal_apps_180d >= 3 THEN 1 ELSE 0 END                 AS r_name_postal_reuse,
+
+  -- Combined flag: at least one rule
+  CASE 
+    WHEN (ip_apps_7d >= 5)
+       OR (phone_apps_30d >= 3)
+       OR (addr_apps_90d >= 4)
+       OR (card_cnt >= 3 AND bin_distinct_cnt >= 2)
+       OR (name_postal_apps_180d >= 3)
+    THEN 1 ELSE 0 END AS rule_flag_any
+FROM Risk.vw_features_app;
+GO
+
+
+-- 6A) Overall KPIs for the combined rule
+WITH X AS (
+  SELECT
+    rule_flag_any,
+    true_fraud_ind
+  FROM Risk.vw_rule_flags
+),
+CM AS (
+  SELECT
+    SUM(CASE WHEN rule_flag_any=1 AND true_fraud_ind=1 THEN 1 ELSE 0 END) AS TP,
+    SUM(CASE WHEN rule_flag_any=1 AND true_fraud_ind=0 THEN 1 ELSE 0 END) AS FP,
+    SUM(CASE WHEN rule_flag_any=0 AND true_fraud_ind=1 THEN 1 ELSE 0 END) AS FN,
+    SUM(CASE WHEN rule_flag_any=0 AND true_fraud_ind=0 THEN 1 ELSE 0 END) AS TN
+  FROM X
+)
+SELECT
+  TP, FP, FN, TN,
+  CAST(TP*1.0/NULLIF(TP+FN,0) AS decimal(9,4)) AS TPR_recall,
+  CAST(TN*1.0/NULLIF(TN+FP,0) AS decimal(9,4)) AS TNR_specificity,
+  CAST(FP*1.0/NULLIF(FP+TN,0) AS decimal(9,4)) AS FPR,             -- False Positive Rate
+  CAST(TP*1.0/NULLIF(TP+FP,0) AS decimal(9,4)) AS Precision,
+  CAST(2.0*TP*1.0/NULLIF(2*TP+FP+FN,0) AS decimal(9,4))            AS F1
+FROM CM;
+
+
+-- 6B) KPIs by application date
+WITH X AS (
+  SELECT app_date, rule_flag_any, true_fraud_ind
+  FROM Risk.vw_rule_flags
+),
+CM AS (
+  SELECT
+    app_date,
+    SUM(CASE WHEN rule_flag_any=1 AND true_fraud_ind=1 THEN 1 ELSE 0 END) AS TP,
+    SUM(CASE WHEN rule_flag_any=1 AND true_fraud_ind=0 THEN 1 ELSE 0 END) AS FP,
+    SUM(CASE WHEN rule_flag_any=0 AND true_fraud_ind=1 THEN 1 ELSE 0 END) AS FN,
+    SUM(CASE WHEN rule_flag_any=0 AND true_fraud_ind=0 THEN 1 ELSE 0 END) AS TN
+  FROM X
+  GROUP BY app_date
+)
+SELECT
+  app_date, TP, FP, FN, TN,
+  CAST(FP*1.0/NULLIF(FP+TN,0) AS decimal(9,4)) AS FPR,
+  CAST(TP*1.0/NULLIF(TP+FN,0) AS decimal(9,4)) AS TPR,
+  CAST(TP*1.0/NULLIF(TP+FP,0) AS decimal(9,4)) AS Precision
+FROM CM
+ORDER BY app_date;
+
+-- 6C) KPIs by City/State (top-N)
+WITH X AS (
+  SELECT city_u, state_u, rule_flag_any, true_fraud_ind
+  FROM Risk.vw_rule_flags
+),
+CM AS (
+  SELECT
+    city_u, state_u,
+    SUM(CASE WHEN rule_flag_any=1 AND true_fraud_ind=1 THEN 1 ELSE 0 END) AS TP,
+    SUM(CASE WHEN rule_flag_any=1 AND true_fraud_ind=0 THEN 1 ELSE 0 END) AS FP,
+    SUM(CASE WHEN rule_flag_any=0 AND true_fraud_ind=1 THEN 1 ELSE 0 END) AS FN,
+    SUM(CASE WHEN rule_flag_any=0 AND true_fraud_ind=0 THEN 1 ELSE 0 END) AS TN
+  FROM X
+  GROUP BY city_u, state_u
+)
+SELECT TOP 50
+  city_u, state_u, TP, FP, FN, TN,
+  CAST(FP*1.0/NULLIF(FP+TN,0) AS decimal(9,4)) AS FPR,
+  CAST(TP*1.0/NULLIF(TP+FN,0) AS decimal(9,4)) AS TPR,
+  CAST(TP*1.0/NULLIF(TP+FP,0) AS decimal(9,4)) AS Precision
+FROM CM
+ORDER BY FPR DESC, TP DESC;
+
+
+-- 6D) Per-rule lift / KPI
+SELECT
+  'r_ip_velocity' AS rule_name,
+  SUM(CASE WHEN r_ip_velocity=1 AND true_fraud_ind=1 THEN 1 ELSE 0 END) AS TP,
+  SUM(CASE WHEN r_ip_velocity=1 AND true_fraud_ind=0 THEN 1 ELSE 0 END) AS FP
+FROM Risk.vw_rule_flags
+UNION ALL
+SELECT
+  'r_phone_reuse',
+  SUM(CASE WHEN r_phone_reuse=1 AND true_fraud_ind=1 THEN 1 ELSE 0 END),
+  SUM(CASE WHEN r_phone_reuse=1 AND true_fraud_ind=0 THEN 1 ELSE 0 END)
+FROM Risk.vw_rule_flags
+UNION ALL
+SELECT
+  'r_address_cluster',
+  SUM(CASE WHEN r_address_cluster=1 AND true_fraud_ind=1 THEN 1 ELSE 0 END),
+  SUM(CASE WHEN r_address_cluster=1 AND true_fraud_ind=0 THEN 1 ELSE 0 END)
+FROM Risk.vw_rule_flags
+UNION ALL
+SELECT
+  'r_multi_card_multi_bin',
+  SUM(CASE WHEN r_multi_card_multi_bin=1 AND true_fraud_ind=1 THEN 1 ELSE 0 END),
+  SUM(CASE WHEN r_multi_card_multi_bin=1 AND true_fraud_ind=0 THEN 1 ELSE 0 END)
+FROM Risk.vw_rule_flags
+UNION ALL
+SELECT
+  'r_name_postal_reuse',
+  SUM(CASE WHEN r_name_postal_reuse=1 AND true_fraud_ind=1 THEN 1 ELSE 0 END),
+  SUM(CASE WHEN r_name_postal_reuse=1 AND true_fraud_ind=0 THEN 1 ELSE 0 END)
+FROM Risk.vw_rule_flags;
+
+
+
+-- On Applications (heavy reuse lookups)
+CREATE INDEX IX_Apps_appdt       ON Risk.dbo.Applications(app_dt);
+CREATE INDEX IX_Apps_phone       ON Risk.dbo.Applications(phone);
+CREATE INDEX IX_Apps_email       ON Risk.dbo.Applications(email);
+CREATE INDEX IX_Apps_ip          ON Risk.dbo.Applications(ip_address);
+CREATE INDEX IX_Apps_addr_postal ON Risk.dbo.Applications(address1, postal_code);
+
+-- On Cards
+CREATE INDEX IX_Cards_app        ON CardsDB.dbo.Cards(app_id);
+CREATE INDEX IX_Cards_bin        ON CardsDB.dbo.Cards(app_id, bin) INCLUDE (last4, product, status, opened_dt);
