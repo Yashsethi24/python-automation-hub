@@ -1,0 +1,68 @@
+import datetime as dt
+from pathlib import Path
+import win32com.client as win32
+from win32com.client import constants
+
+
+def send_confidential_email(
+    to,
+    cc=None,
+    subject_base="Automated Report",
+    body_text="Please find the report attached.",
+    attachment_path=None,
+):
+    """
+    Send an email via Outlook with:
+    - dynamic date in subject
+    - confidential sensitivity
+    - optional attachment
+    """
+
+    # Make sure Outlook COM constants are available
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    mail = outlook.CreateItem(0)  # 0 = olMailItem
+
+    # --- Recipients ---
+    # Accept a single string or a list of addresses
+    if isinstance(to, (list, tuple, set)):
+        mail.To = "; ".join(to)
+    else:
+        mail.To = str(to)
+
+    if cc:
+        if isinstance(cc, (list, tuple, set)):
+            mail.CC = "; ".join(cc)
+        else:
+            mail.CC = str(cc)
+
+    # --- Subject with dynamic date ---
+    today_str = dt.datetime.now().strftime("%d %b %Y")   # e.g. "19 Nov 2025"
+    mail.Subject = f"{subject_base} - {today_str}"
+
+    # --- Body text ---
+    mail.Body = body_text
+
+    # --- Mark as Confidential ---
+    mail.Sensitivity = constants.olConfidential  # 3 = Confidential
+
+    # --- Optional attachment ---
+    if attachment_path:
+        p = Path(attachment_path).expanduser().resolve()
+        mail.Attachments.Add(str(p))
+
+    # Send the email (use .Display() instead if you want to review before sending)
+    mail.Send()
+
+
+if __name__ == "__main__":
+    send_confidential_email(
+        to=["person1@company.com", "person2@company.com"],
+        cc=["manager@company.com"],
+        subject_base="Daily Fraud Trends",
+        body_text=(
+            "Hi team,\n\n"
+            "Please find attached today's fraud trends report.\n\n"
+            "Regards,\nNikhil"
+        ),
+        attachment_path=r"C:\Users\hp\Downloads\AI Upskilling Roadmap by Aditya Sharma.pdf",
+    )
