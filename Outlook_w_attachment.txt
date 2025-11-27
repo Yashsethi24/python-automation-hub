@@ -65,3 +65,18 @@ def reply_to_latest_email(
         reply.Display()
     else:
         reply.Send()
+
+reply_to_latest_email(
+    subject_text="Daily Fraud Trends",   # part of the subject
+    reply_message_html="""
+        <p>Hi team,<br><br>
+        Please find attached today’s updated report in this thread.<br><br>
+        Regards,<br>
+        Nikhil
+        </p>
+    """,
+    reply_all=True,
+    attachment_path=r"C:\Users\hp\Downloads\Daily_Fraud_Trends_20251119.xlsx",
+    mark_confidential=True,
+    display_instead_of_send=True,  # change to False if you want auto-send
+)
