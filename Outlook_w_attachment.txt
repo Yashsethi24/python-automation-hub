@@ -1,0 +1,67 @@
+import datetime as dt
+from pathlib import Path
+import win32com.client as win32
+from win32com.client import constants
+
+
+def find_email_by_subject(subject_text, since_days=30, folder="Inbox"):
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    ns = outlook.GetNamespace("MAPI")
+
+    # 6 = Inbox, 5 = Sent Items
+    if folder.lower() in ("inbox",):
+        root = ns.GetDefaultFolder(6)
+    elif folder.lower() in ("sent", "sent items"):
+        root = ns.GetDefaultFolder(5)
+    else:
+        root = ns.GetDefaultFolder(6)  # default to Inbox
+
+    cutoff = (dt.datetime.now() - dt.timedelta(days=since_days)).strftime("%m/%d/%Y %I:%M %p")
+    items = root.Items.Restrict(f"[ReceivedTime] >= '{cutoff}'")
+    items.Sort("[ReceivedTime]", True)  # newest first
+
+    subject_text = (subject_text or "").lower()
+
+    for mail in items:
+        if getattr(mail, "Class", None) == 43:  # 43 = MailItem
+            if mail.Subject and subject_text in mail.Subject.lower():
+                return mail
+
+    return None
+
+
+def reply_to_latest_email(
+    subject_text,
+    reply_message_html,
+    reply_all=True,
+    attachment_path=None,
+    mark_confidential=True,
+    display_instead_of_send=True,
+):
+    email = find_email_by_subject(subject_text)
+
+    if email is None:
+        raise RuntimeError(f"No email found with subject containing: {subject_text!r}")
+
+    # Reply or ReplyAll
+    reply = email.ReplyAll() if reply_all else email.Reply()
+
+    # Prepend your message to the thread
+    reply.HTMLBody = reply_message_html + reply.HTMLBody
+
+    # Optional: mark as Confidential
+    if mark_confidential:
+        reply.Sensitivity = constants.olConfidential  # 3
+
+    # Optional: add attachment
+    if attachment_path:
+        p = Path(attachment_path).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(p)
+        reply.Attachments.Add(str(p))
+
+    # Either open for review or send directly
+    if display_instead_of_send:
+        reply.Display()
+    else:
+        reply.Send()
