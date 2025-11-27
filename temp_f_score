@@ -1,55 +1,69 @@
 import pandas as pd
 
-# Make a copy so we don't mess the original
 df_scores = df.copy()
 
-# Assume lower scores = riskier → sort ascending
-df_scores = df_scores.sort_values('scores')
+# Assume lower scores = riskier; sort so we flag from highest-risk to lowest-risk
+df_scores = df_scores.sort_values('scores')  # use ascending=False if higher = riskier
 
-# Non-fraud indicator
+# Indicators
 df_scores['nonfraud'] = 1 - df_scores['fraud']
 
-# Cumulative counts (moving from lowest score upward)
+# Amount of fraud and non-fraud per row
+df_scores['fraud_amt'] = df_scores['CUR_BAL_TOT_SUM'] * df_scores['fraud']
+df_scores['nonfraud_amt'] = df_scores['CUR_BAL_TOT_SUM'] * df_scores['nonfraud']
+
+# Totals (for percentages)
+total_fraud_cnt = df_scores['fraud'].sum()
+total_fraud_amt = df_scores['fraud_amt'].sum()
+total_nonfraud_cnt = df_scores['nonfraud'].sum()
+total_nonfraud_amt = df_scores['nonfraud_amt'].sum()
+
+# Cumulative counts
 df_scores['cum_total'] = 1
 df_scores['cum_total'] = df_scores['cum_total'].cumsum()
 
-df_scores['cum_fraud'] = df_scores['fraud'].cumsum()
-df_scores['cum_nonfraud'] = df_scores['nonfraud'].cumsum()
+df_scores['cum_fraud_cnt'] = df_scores['fraud'].cumsum()
+df_scores['cum_nonfraud_cnt'] = df_scores['nonfraud'].cumsum()
 
-# Overall totals (for rates)
-total_nonfraud = df_scores['nonfraud'].sum()
-total_fraud = df_scores['fraud'].sum()
+# Cumulative amounts
+df_scores['cum_fraud_amt'] = df_scores['fraud_amt'].cumsum()
+df_scores['cum_nonfraud_amt'] = df_scores['nonfraud_amt'].cumsum()
 
-# Cumulative FPR & TPR at each row
-df_scores['cum_fpr'] = df_scores['cum_nonfraud'] / total_nonfraud   # false positive rate
-df_scores['cum_tpr'] = df_scores['cum_fraud'] / total_fraud         # true positive rate (recall)
+# Rates by count
+df_scores['cum_fpr_cnt'] = df_scores['cum_nonfraud_cnt'] / total_nonfraud_cnt
+df_scores['cum_tpr_cnt'] = df_scores['cum_fraud_cnt'] / total_fraud_cnt
 
-
+# Rates by amount
+df_scores['cum_fpr_amt'] = df_scores['cum_nonfraud_amt'] / total_nonfraud_amt
+df_scores['cum_tpr_amt'] = df_scores['cum_fraud_amt'] / total_fraud_amt
 
 cutoff_table = (
-    df_scores[['scores', 'cum_total', 'cum_fraud', 'cum_nonfraud', 'cum_fpr', 'cum_tpr']]
+    df_scores[
+        [
+            'scores',
+            'cum_total',
+            'cum_fraud_cnt',
+            'cum_nonfraud_cnt',
+            'cum_fraud_amt',
+            'cum_nonfraud_amt',
+            'cum_fpr_cnt',
+            'cum_tpr_cnt',
+            'cum_fpr_amt',
+            'cum_tpr_amt'
+        ]
+    ]
     .drop_duplicates(subset='scores', keep='last')
     .rename(columns={
         'scores': 'score_cutoff',
-        'cum_total': 'flagged_volume'
+        'cum_total': 'flagged_volume',
+        'cum_fraud_cnt': 'flagged_fraud_cnt',
+        'cum_nonfraud_cnt': 'flagged_nonfraud_cnt',
+        'cum_fraud_amt': 'flagged_fraud_amt',
+        'cum_nonfraud_amt': 'flagged_nonfraud_amt',
+        'cum_tpr_cnt': 'fraud_capture_rate_cnt',
+        'cum_tpr_amt': 'fraud_capture_rate_amt'
     })
     .reset_index(drop=True)
 )
 
 print(cutoff_table.head(20))
-
-
-cutoff_table['cum_false_positives'] = cutoff_table['flagged_volume'] - cutoff_table['cum_fraud']
-
-
-target_fpr = 0.05  # 5%
-
-valid_cutoffs = cutoff_table[cutoff_table['cum_fpr'] <= target_fpr]
-
-# Take the highest cutoff that respects the FPR constraint
-best_cutoff_row = valid_cutoffs.tail(1)
-
-print(best_cutoff_row)
-
-df_scores = df.copy()
-df_scores = df_scores.sort_values('scores', ascending=False)
