@@ -80,3 +80,79 @@ reply_to_latest_email(
     mark_confidential=True,
     display_instead_of_send=True,  # change to False if you want auto-send
 )
+
+
+
+import os
+import shutil
+import win32com.client as win32
+
+from win32com.client import gencache
+
+# 1. Find path to gen_py cache
+gen_path = gencache.GetGeneratePath()
+print("gen_py path:", gen_path)
+
+# 2. Delete the folder recursively
+shutil.rmtree(gen_path, ignore_errors=True)
+print("Deleted gen_py cache (if it existed).")
+
+
+import win32com.client as win32
+
+outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+ns = outlook.GetNamespace("MAPI")
+print("Outlook connected, stores:", [f.Name for f in ns.Folders])
+
+pip install --force-reinstall pywin32
+
+import datetime as dt
+import win32com.client as win32
+
+OL_FOLDER_INBOX = 6
+OL_MAIL_ITEM = 43
+
+def find_latest_email_by_subject(snippet, since_days=30):
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    ns = outlook.GetNamespace("MAPI")
+    inbox = ns.GetDefaultFolder(OL_FOLDER_INBOX)
+
+    cutoff = (dt.datetime.now() - dt.timedelta(days=since_days)).strftime("%m/%d/%Y %I:%M %p")
+    items = inbox.Items.Restrict(f"[ReceivedTime] >= '{cutoff}'")
+    items.Sort("[ReceivedTime]", True)  # newest first
+
+    snippet = (snippet or "").lower()
+
+    for item in items:
+        if getattr(item, "Class", None) == OL_MAIL_ITEM:
+            subj = item.Subject or ""
+            if snippet in subj.lower():
+                return item
+    return None
+
+def reply_plaintext_to_thread(subject_snippet, reply_text, reply_all=True):
+    msg = find_latest_email_by_subject(subject_snippet)
+    if msg is None:
+        raise RuntimeError(f"No email found with subject containing: {subject_snippet!r}")
+
+    # Reply in the same thread
+    reply = msg.ReplyAll() if reply_all else msg.Reply()
+
+    # Prepend your plain-text message, keep the chain below
+    reply.Body = reply_text + "\n\n" + reply.Body
+
+    # Show so you can review and send
+    reply.Display()      # or reply.Send() to auto-send
+
+
+# Example usage:
+if __name__ == "__main__":
+    reply_plaintext_to_thread(
+        subject_snippet="Daily Fraud Trends",
+        reply_text=(
+            "Hi team,\n\n"
+            "Here is today's update in this thread.\n"
+            "Regards,\nNikhil"
+        ),
+        reply_all=True,
+    )
