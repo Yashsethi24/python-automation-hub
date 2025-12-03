@@ -279,3 +279,56 @@ CREATE INDEX IX_Apps_addr_postal ON Risk.dbo.Applications(address1, postal_code)
 -- On Cards
 CREATE INDEX IX_Cards_app        ON CardsDB.dbo.Cards(app_id);
 CREATE INDEX IX_Cards_bin        ON CardsDB.dbo.Cards(app_id, bin) INCLUDE (last4, product, status, opened_dt);
+
+
+
+
+
+
+DECLARE 
+    @scenario_id INT,
+    @months_back INT,
+    @fraud_cap_amount DECIMAL(18,2),
+    @fpr_threshold FLOAT;
+
+DECLARE scenario_cursor CURSOR FOR
+SELECT scenario_id, months_back, fraud_cap_amount, fpr_threshold
+FROM #Scenarios;
+
+OPEN scenario_cursor;
+FETCH NEXT FROM scenario_cursor INTO @scenario_id, @months_back, @fraud_cap_amount, @fpr_threshold;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    INSERT INTO #ScenarioResults (
+        scenario_id,
+        months_back,
+        fraud_cap_amount,
+        fpr_threshold,
+        rule_name,
+        unique_apps_6m,
+        unique_fraud_amt_6m
+    )
+    EXEC sp_executesql
+        @sql,
+        N'@months_back INT, @fraud_cap_amount DECIMAL(18,2), @fpr_threshold FLOAT',
+        @months_back = @months_back,
+        @fraud_cap_amount = @fraud_cap_amount,
+        @fpr_threshold = @fpr_threshold;
+
+    -- Update rows we just inserted with scenario metadata
+    -- (If your SELECT already returns them, you can embed constants in @sql instead.)
+    UPDATE r
+    SET r.months_back      = s.months_back,
+        r.fraud_cap_amount = s.fraud_cap_amount,
+        r.fpr_threshold    = s.fpr_threshold
+    FROM #ScenarioResults r
+    JOIN #Scenarios s
+      ON s.scenario_id = @scenario_id
+    WHERE r.scenario_id IS NULL;  -- only rows from this iteration
+
+    FETCH NEXT FROM scenario_cursor INTO @scenario_id, @months_back, @fraud_cap_amount, @fpr_threshold;
+END
+
+CLOSE scenario_cursor;
+DEALLOCATE scenario_cursor;
