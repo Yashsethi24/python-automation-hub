@@ -1,0 +1,89 @@
+-------------------------------
+-- 1. Dummy Data
+-------------------------------
+CREATE TABLE Employees (
+    emp_id INT,
+    dept VARCHAR(50),
+    salary INT
+);
+
+INSERT INTO Employees VALUES
+(1, 'HR',     40000),
+(2, 'Finance',70000),
+(3, 'IT',     90000),
+(4, 'HR',     35000),
+(5, 'IT',    120000);
+
+
+-------------------------------
+-- 2. Scenario table
+-------------------------------
+CREATE TABLE #Scenarios (
+    scenario_id INT IDENTITY(1,1),
+    salary_cap INT
+);
+
+INSERT INTO #Scenarios (salary_cap)
+VALUES (50000), (80000), (100000);
+
+
+-------------------------------
+-- 3. Results table
+-------------------------------
+CREATE TABLE #ScenarioResults (
+    scenario_id INT,
+    salary_cap INT,
+    emp_id INT,
+    dept VARCHAR(50),
+    salary INT
+);
+
+
+-------------------------------
+-- 4. Dynamic SQL Text
+-------------------------------
+DECLARE @sql NVARCHAR(MAX) = N'
+SELECT
+    @scenario_id AS scenario_id,
+    @salary_cap AS salary_cap,
+    emp_id,
+    dept,
+    salary
+FROM Employees
+WHERE salary <= @salary_cap;
+';
+
+
+-------------------------------
+-- 5. Loop through scenarios
+-------------------------------
+DECLARE 
+    @scenario_id INT,
+    @salary_cap INT;
+
+DECLARE scenario_cursor CURSOR FOR
+SELECT scenario_id, salary_cap FROM #Scenarios;
+
+OPEN scenario_cursor;
+FETCH NEXT FROM scenario_cursor INTO @scenario_id, @salary_cap;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    INSERT INTO #ScenarioResults
+    EXEC sp_executesql
+        @sql,
+        N'@scenario_id INT, @salary_cap INT',
+        @scenario_id = @scenario_id,
+        @salary_cap = @salary_cap;
+
+    FETCH NEXT FROM scenario_cursor INTO @scenario_id, @salary_cap;
+END
+
+CLOSE scenario_cursor;
+DEALLOCATE scenario_cursor;
+
+
+-------------------------------
+-- 6. See the final results
+-------------------------------
+SELECT * FROM #ScenarioResults;
