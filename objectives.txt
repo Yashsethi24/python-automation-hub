@@ -1,0 +1,90 @@
+Goal 1 – Analytical Excellence & Reproducibility
+
+Objective:
+Deliver fully accurate, reproducible analytics and dashboards for application fraud strategies.
+
+Success measures:
+
+Zero high-severity discrepancies identified after sharing key dashboards/analyses.
+
+100% of BAU dashboards and major analyses supported by documented, version-controlled SQL/Python that others can reuse.
+
+At least 3 major analyses/rule evaluations peer-reviewed and validated by a colleague.
+
+Goal 2 – Fraud Strategy Impact (Rules & Loss Reduction)
+
+Objective:
+Design and optimize application fraud rules that materially reduce fraud loss while controlling false positives and customer impact.
+
+Success measures:
+
+Lead at least 1–2 new or significantly optimized rules/strategies with modeled annualized fraud loss reduction ≥ $X (to be agreed with manager).
+
+Optimize or decommission at least 2 low-performing rules (e.g., poor detection, high FPs, or high ops burden).
+
+Produce a simple one-pager for each rule (problem, approach, KPIs, savings, customer/ops impact, recommendation).
+
+Goal 3 – Efficiency & Reusable Analytics (Automation)
+
+Objective:
+Improve team efficiency by building reusable tools and automation for fraud analytics and alert handling.
+
+Success measures:
+
+Deliver the automated tool that pulls credit cards associated with alerted applications and routes them to the block queue, with measurable fraud and/or ops benefits.
+
+Automate or streamline at least 3 recurring manual analyses/reports, targeting ≥ 10 hours/month saved for the team.
+
+Create a small library of reusable SQL/Python templates for performance evaluation and spike investigations, stored and documented in a shared location.
+
+Goal 4 – Experimentation & Long-Term Strategy (Champion/Challenger)
+
+Objective:
+Bring structured experimentation and champion/challenger testing into application fraud strategy design.
+
+Success measures:
+
+Design and run at least 2 champion/challenger tests (e.g., new rules, thresholds, prioritization logic).
+
+Align on a standard KPI set for tests (fraud savings, detection, FPs, customer impact, ops load).
+
+Provide concise experiment readouts that lead to clear decisions (roll-out, refine, or retire).
+
+Goal 5 – FIQM → FICO Migration & Platform Expertise
+
+Objective:
+Become a go-to SME for application fraud strategies in the FIQM to FICO migration.
+
+Success measures:
+
+Lead or co-lead migration and validation of 5–10 high-impact application fraud rules into FICO.
+
+Document key differences, risks, and best practices for designing and monitoring application fraud rules in FICO.
+
+Deliver at least 1 knowledge-sharing session on FICO usage for fraud rules/strategy.
+
+Goal 6 – Communication, Visibility & Leadership
+
+Objective:
+Increase visibility and demonstrate leadership through storytelling, collaboration, and knowledge-sharing.
+
+Success measures:
+
+Continue to own and present the strategy performance dashboard to the larger forum, focusing on clear insight-driven narratives and recommended actions.
+
+Lead at least 2 knowledge-sharing sessions within the fraud/analytics community at TD (e.g., fraud trends, new tools, champion/challenger results).
+
+Act as the primary analytics/strategy contact on at least 1 cross-team initiative (e.g., with operations, technology, product, or credit).
+
+Goal 7 – Technical Growth: Power BI & Production-Quality Analytics
+
+Objective:
+Strengthen technical capabilities to support production-quality analytics, dashboards, and experimentation.
+
+Success measures:
+
+Become proficient in Power BI and convert at least one existing manual/Excel-based report into a production Power BI dashboard adopted by stakeholders.
+
+Standardize Python workflows for at least 2 key analyses (e.g., rule performance, spike investigations) with clear inputs/outputs.
+
+Complete at least one structured learning activity (course or internal training) related to advanced analytics/experimentation and apply it in at least one project.
