@@ -88,3 +88,8 @@ Become proficient in Power BI and convert at least one existing manual/Excel-bas
 Standardize Python workflows for at least 2 key analyses (e.g., rule performance, spike investigations) with clear inputs/outputs.
 
 Complete at least one structured learning activity (course or internal training) related to advanced analytics/experimentation and apply it in at least one project.
+
+
+formatted_list = ','.join(
+    ["'{}'".format(v.replace("'", "''")) for v in values]
+)
