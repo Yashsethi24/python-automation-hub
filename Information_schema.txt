@@ -1,0 +1,20 @@
+DECLARE @sql NVARCHAR(MAX) = '';
+
+SELECT @sql = @sql + '
+SELECT
+    ''' + COLUMN_NAME + ''' AS column_name,
+    COUNT(' + QUOTENAME(COLUMN_NAME) + ') AS non_null_rows,
+    COUNT(*) AS total_rows,
+    CAST(COUNT(' + QUOTENAME(COLUMN_NAME) + ') * 100.0 / COUNT(*) AS DECIMAL(5,2)) AS non_null_pct
+FROM your_schema.your_table
+WHERE run_date >= ''2024-11-01''
+  AND run_date <  ''2024-12-01''
+UNION ALL'
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'your_schema'
+  AND TABLE_NAME   = 'your_table';
+
+-- Remove last UNION ALL
+SET @sql = LEFT(@sql, LEN(@sql) - 9);
+
+EXEC sp_executesql @sql;
