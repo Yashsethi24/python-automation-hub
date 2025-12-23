@@ -1,25 +1,76 @@
-def risk_encode(df, col, target, min_count=50, global_rate=None):
+def loss_weighted_risk_encode(
+    df,
+    col,
+    target_col,
+    loss_col,
+    top_n=20,
+    min_count=50,
+    global_strategy="mean"  # or "median"
+):
+    """
+    Loss-aware risk encoding for high-cardinality categorical variables
+    """
+
+    # Global fallback value
+    if global_strategy == "mean":
+        global_value = df.loc[df[target_col] == 1, loss_col].mean()
+    else:
+        global_value = df.loc[df[target_col] == 1, loss_col].median()
+
+    # Aggregate stats per category
     stats = (
-        df.groupby(col)[target]
-        .agg(['mean', 'count'])
-        .reset_index()
+        df.groupby(col)
+          .agg(
+              total_loss=(loss_col, 'sum'),
+              fraud_cnt=(target_col, 'sum'),
+              app_cnt=(target_col, 'count')
+          )
+          .reset_index()
     )
 
-    if global_rate is None:
-        global_rate = df[target].mean()
+    # Rank by total loss
+    stats = stats.sort_values('total_loss', ascending=False)
 
-    stats['risk'] = stats.apply(
-        lambda x: x['mean'] if x['count'] >= min_count else global_rate,
+    # Keep only top N loss-driving categories
+    top_categories = stats.head(top_n)[col].tolist()
+
+    # Compute loss-based risk
+    stats['loss_risk'] = stats.apply(
+        lambda x:
+            (x['total_loss'] / x['app_cnt'])
+            if x['app_cnt'] >= min_count
+            else global_value,
         axis=1
     )
 
-    return df[col].map(stats.set_index(col)['risk']).fillna(global_rate)
+    # Map back to dataframe
+    encoded = df[col].map(
+        stats.set_index(col)['loss_risk']
+    )
+
+    # Replace non-top or missing with global fallback
+    encoded = encoded.where(
+        df[col].isin(top_categories),
+        global_value
+    ).fillna(global_value)
+
+    return encoded
 
 
-train_df['occupation_risk'] = risk_encode(
-    train_df, 'occupation', 'target', min_count=100
+train_df['occupation_loss_risk'] = loss_weighted_risk_encode(
+    df=train_df,
+    col='occupation',
+    target_col='target',
+    loss_col='CUR_BAL_SUM_TOT',
+    top_n=25,
+    min_count=100
 )
 
-train_df['city_risk'] = risk_encode(
-    train_df, 'city', 'target', min_count=100
+train_df['city_loss_risk'] = loss_weighted_risk_encode(
+    df=train_df,
+    col='city',
+    target_col='target',
+    loss_col='CUR_BAL_SUM_TOT',
+    top_n=30,
+    min_count=100
 )
