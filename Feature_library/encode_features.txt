@@ -1,0 +1,25 @@
+def risk_encode(df, col, target, min_count=50, global_rate=None):
+    stats = (
+        df.groupby(col)[target]
+        .agg(['mean', 'count'])
+        .reset_index()
+    )
+
+    if global_rate is None:
+        global_rate = df[target].mean()
+
+    stats['risk'] = stats.apply(
+        lambda x: x['mean'] if x['count'] >= min_count else global_rate,
+        axis=1
+    )
+
+    return df[col].map(stats.set_index(col)['risk']).fillna(global_rate)
+
+
+train_df['occupation_risk'] = risk_encode(
+    train_df, 'occupation', 'target', min_count=100
+)
+
+train_df['city_risk'] = risk_encode(
+    train_df, 'city', 'target', min_count=100
+)
