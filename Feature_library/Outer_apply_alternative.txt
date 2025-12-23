@@ -1,0 +1,32 @@
+WITH apps_filtered AS (
+    SELECT a.application_id, a.col1, a.col2  -- select only what you need
+    FROM dbo.applications a
+    WHERE 1=1
+      -- your filters here
+),
+actions_scoped AS (
+    SELECT
+        act.application_id,
+        act.action_status_name,
+        rn = ROW_NUMBER() OVER (
+                 PARTITION BY act.application_id
+                 ORDER BY act.date_updated DESC, act.action_id DESC
+             )
+    FROM dbo.actions act
+    INNER JOIN apps_filtered a
+        ON a.application_id = act.application_id
+    WHERE act.date_updated > @start_date
+),
+action_flags AS (
+    SELECT
+        application_id,
+        action_flag_hs = MAX(CASE WHEN rn = 1 AND action_status_name IN ('H','S') THEN 1 ELSE 0 END)
+    FROM actions_scoped
+    GROUP BY application_id
+)
+SELECT
+    a.*,
+    COALESCE(af.action_flag_hs, 0) AS action_flag_hs
+FROM apps_filtered a
+LEFT JOIN action_flags af
+    ON af.application_id = a.application_id;
