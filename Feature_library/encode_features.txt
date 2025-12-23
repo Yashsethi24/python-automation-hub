@@ -1,60 +1,38 @@
-def loss_weighted_risk_encode(
+def keep_top_n_by_loss(
     df,
     col,
-    target_col,
     loss_col,
     top_n=20,
     min_count=50,
-    global_strategy="mean"  # or "median"
+    other_label="OTHER"
 ):
     """
-    Loss-aware risk encoding for high-cardinality categorical variables
+    Keeps top N categories by total loss and
+    maps the rest to OTHER.
     """
 
-    # Global fallback value
-    if global_strategy == "mean":
-        global_value = df.loc[df[target_col] == 1, loss_col].mean()
-    else:
-        global_value = df.loc[df[target_col] == 1, loss_col].median()
-
-    # Aggregate stats per category
     stats = (
         df.groupby(col)
           .agg(
               total_loss=(loss_col, 'sum'),
-              fraud_cnt=(target_col, 'sum'),
-              app_cnt=(target_col, 'count')
+              cnt=(col, 'count')
           )
           .reset_index()
     )
 
-    # Rank by total loss
-    stats = stats.sort_values('total_loss', ascending=False)
+    # Optional stability filter
+    stats = stats[stats['cnt'] >= min_count]
 
-    # Keep only top N loss-driving categories
-    top_categories = stats.head(top_n)[col].tolist()
-
-    # Compute loss-based risk
-    stats['loss_risk'] = stats.apply(
-        lambda x:
-            (x['total_loss'] / x['app_cnt'])
-            if x['app_cnt'] >= min_count
-            else global_value,
-        axis=1
+    # Rank by loss
+    top_values = (
+        stats
+        .sort_values('total_loss', ascending=False)
+        .head(top_n)[col]
+        .tolist()
     )
 
-    # Map back to dataframe
-    encoded = df[col].map(
-        stats.set_index(col)['loss_risk']
-    )
+    return df[col].where(df[col].isin(top_values), other_label)
 
-    # Replace non-top or missing with global fallback
-    encoded = encoded.where(
-        df[col].isin(top_categories),
-        global_value
-    ).fillna(global_value)
-
-    return encoded
 
 
 train_df['occupation_loss_risk'] = loss_weighted_risk_encode(
