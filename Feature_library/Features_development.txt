@@ -1,0 +1,93 @@
+/* Example: build standardized fields + prefixes/suffixes */
+WITH base AS (
+    SELECT
+        t.*,
+
+        /* =========================
+           EMAIL preprocessing
+           - trim
+           - lower-case (recommended for email)
+           ========================= */
+        email_norm =
+            LOWER(LTRIM(RTRIM(t.email_address))),
+
+        /* =========================
+           PHONE preprocessing
+           - keep digits only (remove spaces, (), -, +, etc.)
+           ========================= */
+        phone_digits =
+            NULLIF(
+                REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                    LTRIM(RTRIM(t.Mobile_telephone)),
+                    ' ', ''),
+                    '(', ''),
+                    ')', ''),
+                    '-', ''),
+                    '.', ''),
+                    '/', ''),
+                    '\', ''),
+                    '+', ''),
+                    CHAR(9), ''),
+                    CHAR(13), ''),
+                    CHAR(10), ''),
+                ''
+            ),
+
+        /* =========================
+           POSTAL preprocessing (Canada-style)
+           - trim
+           - upper-case
+           - remove spaces
+           ========================= */
+        postal_norm =
+            NULLIF(
+                REPLACE(UPPER(LTRIM(RTRIM(t.Address_Postal_Code))), ' ', ''),
+                ''
+            )
+    FROM dbo.YourTable t
+),
+feat AS (
+    SELECT
+        b.*,
+
+        /* ========== EMAIL FIRST/LAST 3-4 ========== */
+        email_first3 = CASE WHEN b.email_norm IS NULL OR LEN(b.email_norm) < 3 THEN NULL
+                            ELSE LEFT(b.email_norm, 3) END,
+        email_first4 = CASE WHEN b.email_norm IS NULL OR LEN(b.email_norm) < 4 THEN NULL
+                            ELSE LEFT(b.email_norm, 4) END,
+        email_last3  = CASE WHEN b.email_norm IS NULL OR LEN(b.email_norm) < 3 THEN NULL
+                            ELSE RIGHT(b.email_norm, 3) END,
+        email_last4  = CASE WHEN b.email_norm IS NULL OR LEN(b.email_norm) < 4 THEN NULL
+                            ELSE RIGHT(b.email_norm, 4) END,
+
+        /* Optional: email domain (very useful) */
+        email_domain = CASE
+                         WHEN b.email_norm IS NULL THEN NULL
+                         WHEN CHARINDEX('@', b.email_norm) = 0 THEN NULL
+                         ELSE RIGHT(b.email_norm, LEN(b.email_norm) - CHARINDEX('@', b.email_norm))
+                       END,
+
+        /* ========== PHONE FIRST/LAST 3-4 ========== */
+        phone_first3 = CASE WHEN b.phone_digits IS NULL OR LEN(b.phone_digits) < 3 THEN NULL
+                            ELSE LEFT(b.phone_digits, 3) END,
+        phone_first4 = CASE WHEN b.phone_digits IS NULL OR LEN(b.phone_digits) < 4 THEN NULL
+                            ELSE LEFT(b.phone_digits, 4) END,
+        phone_last3  = CASE WHEN b.phone_digits IS NULL OR LEN(b.phone_digits) < 3 THEN NULL
+                            ELSE RIGHT(b.phone_digits, 3) END,
+        phone_last4  = CASE WHEN b.phone_digits IS NULL OR LEN(b.phone_digits) < 4 THEN NULL
+                            ELSE RIGHT(b.phone_digits, 4) END,
+
+        /* ========== POSTAL FIRST/LAST 3-4 ========== */
+        postal_first3 = CASE WHEN b.postal_norm IS NULL OR LEN(b.postal_norm) < 3 THEN NULL
+                             ELSE LEFT(b.postal_norm, 3) END,
+        postal_first4 = CASE WHEN b.postal_norm IS NULL OR LEN(b.postal_norm) < 4 THEN NULL
+                             ELSE LEFT(b.postal_norm, 4) END,
+        postal_last3  = CASE WHEN b.postal_norm IS NULL OR LEN(b.postal_norm) < 3 THEN NULL
+                             ELSE RIGHT(b.postal_norm, 3) END,
+        postal_last4  = CASE WHEN b.postal_norm IS NULL OR LEN(b.postal_norm) < 4 THEN NULL
+                             ELSE RIGHT(b.postal_norm, 4) END
+
+    FROM base b
+)
+SELECT *
+FROM feat;
