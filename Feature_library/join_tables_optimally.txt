@@ -1,24 +1,37 @@
 WITH apps_filtered AS (
-    SELECT a.application_id, a.col1, a.col2  -- select what you need
+    SELECT a.*
     FROM dbo.applications a
-    WHERE a.received_date >= '2025-12-01'
-      AND a.received_date <  '2026-01-01'
+    WHERE 1=1
+      -- your filters here
 ),
 card_flags AS (
     SELECT
         c.application_id,
-        flag_x = MAX(CASE WHEN c.some_card_column = 'YOUR_CONDITION' THEN 1 ELSE 0 END),
-        flag_y = MAX(CASE WHEN c.status = 'BLOCKED' THEN 1 ELSE 0 END)
+        card_flag_x = MAX(CASE WHEN c.some_card_column = 'YOUR_CONDITION' THEN 1 ELSE 0 END)
     FROM dbo.cards c
     INNER JOIN apps_filtered a
         ON a.application_id = c.application_id
-    GROUP BY
-        c.application_id
+    GROUP BY c.application_id
+),
+action_flags AS (
+    SELECT
+        act.application_id,
+        action_flag_hs = MAX(CASE WHEN act.action_status_name IN ('H','S') THEN 1 ELSE 0 END)
+    FROM dbo.actions act
+    INNER JOIN apps_filtered a
+        ON a.application_id = act.application_id
+    GROUP BY act.application_id
+),
+app_features_base AS (
+    SELECT
+        a.*,
+        COALESCE(cf.card_flag_x, 0)    AS card_flag_x,
+        COALESCE(af.action_flag_hs, 0) AS action_flag_hs
+    FROM apps_filtered a
+    LEFT JOIN card_flags cf
+        ON cf.application_id = a.application_id
+    LEFT JOIN action_flags af
+        ON af.application_id = a.application_id
 )
-SELECT
-    a.*,
-    COALESCE(cf.flag_x, 0) AS flag_x,
-    COALESCE(cf.flag_y, 0) AS flag_y
-FROM apps_filtered a
-LEFT JOIN card_flags cf
-    ON cf.application_id = a.application_id;
+SELECT *
+FROM app_features_base;
