@@ -1,0 +1,105 @@
+import numpy as np
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.tree import DecisionTreeClassifier
+
+# Example: update these to your real columns
+NUMERIC_COLS = [
+    "ip_velocity_1d",
+    "num_prev_apps_90d",
+    "device_shared_cnt_7d"
+]
+
+CATEGORICAL_COLS = [
+    "occupation_red",
+    "city_red",
+    "province_red",
+    "age_band",
+    "income_band"
+]
+
+numeric_pipe = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median"))
+])
+
+categorical_pipe = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("ohe", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("num", numeric_pipe, NUMERIC_COLS),
+        ("cat", categorical_pipe, CATEGORICAL_COLS),
+    ],
+    remainder="drop"
+)
+
+model = DecisionTreeClassifier(
+    max_depth=4,
+    min_samples_leaf=100,
+    min_samples_split=300,
+    class_weight="balanced",
+    random_state=42
+)
+
+pipe = Pipeline(steps=[
+    ("prep", preprocess),
+    ("dt", model)
+])
+
+
+
+# train_raw is your original dataframe (no dummies)
+# y_train is target series aligned to train_raw rows
+pipe.fit(train_raw, y_train)
+
+
+dt = pipe.named_steps["dt"]
+X_test_transformed = pipe.named_steps["prep"].transform(test_raw)  # produced from original df
+leaf_id = dt.apply(X_test_transformed)
+
+
+
+def score_leaves_on_original(leaf_id, y_test, test_raw, loss_col=None):
+    eval_df = pd.DataFrame({
+        "leaf_id": leaf_id,
+        "y": y_test.values
+    }, index=test_raw.index)
+
+    if loss_col is not None:
+        eval_df["loss"] = pd.to_numeric(test_raw[loss_col], errors="coerce").fillna(0.0).values
+    else:
+        eval_df["loss"] = 0.0
+
+    total_fraud = eval_df["y"].sum()
+    total_genuine = (eval_df["y"] == 0).sum()
+
+    g = (eval_df.groupby("leaf_id")
+         .agg(alerts=("y", "size"),
+              fraud_cnt=("y", "sum"),
+              loss_captured=("loss", "sum"))
+         .reset_index())
+
+    g["genuine_cnt"] = g["alerts"] - g["fraud_cnt"]
+    g["precision"] = g["fraud_cnt"] / g["alerts"]
+    g["recall"] = (g["fraud_cnt"] / total_fraud) if total_fraud else 0.0
+    g["fpr"] = (g["genuine_cnt"] / total_genuine) if total_genuine else 0.0
+    g["loss_per_alert"] = g["loss_captured"] / g["alerts"]
+
+    return g
+
+
+leaf_kpis = score_leaves_on_original(
+    leaf_id=leaf_id,
+    y_test=y_test,
+    test_raw=test_raw,
+    loss_col="CUR_BAL_SUM_TOT"   # optional
+)
+
+# Join with your rules_df (must include leaf_id)
+results = rules_df.merge(leaf_kpis, on="leaf_id", how="inner")
