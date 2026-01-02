@@ -1,0 +1,46 @@
+import numpy as np
+
+def score_leaves(model, X_test, y_test, test_meta=None, loss_col=None):
+    """
+    test_meta: DataFrame aligned to X_test index (same rows), optional, for loss/amount fields.
+    loss_col: column name in test_meta containing loss amount (e.g., CUR_BAL_SUM_TOT)
+    """
+    leaf = model.apply(X_test)
+
+    df_eval = pd.DataFrame({
+        "leaf_id": leaf,
+        "y": y_test.values
+    }, index=X_test.index)
+
+    if test_meta is not None and loss_col is not None:
+        df_eval["loss"] = test_meta.loc[X_test.index, loss_col].values
+    else:
+        df_eval["loss"] = 0.0
+
+    total_fraud = df_eval["y"].sum()
+    total_genuine = (df_eval["y"] == 0).sum()
+
+    g = df_eval.groupby("leaf_id", sort=False).agg(
+        alerts=("y", "size"),
+        fraud_cnt=("y", "sum"),
+        loss_captured=("loss", "sum")
+    ).reset_index()
+
+    g["genuine_cnt"] = g["alerts"] - g["fraud_cnt"]
+    g["precision"] = g["fraud_cnt"] / g["alerts"]
+    g["recall"] = np.where(total_fraud > 0, g["fraud_cnt"] / total_fraud, 0.0)
+    g["fpr"] = np.where(total_genuine > 0, g["genuine_cnt"] / total_genuine, 0.0)
+    g["loss_per_alert"] = g["loss_captured"] / g["alerts"]
+
+    return g
+
+
+leaf_kpis = score_leaves(
+    dt,
+    X_test,
+    y_test,
+    test_meta=test_df,          # your original df aligned to rows (not one-hot)
+    loss_col="CUR_BAL_SUM_TOT"  # optional
+)
+
+results = rules_df.merge(leaf_kpis, on="leaf_id", how="inner")
