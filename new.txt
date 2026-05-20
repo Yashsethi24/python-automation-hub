@@ -1,0 +1,16 @@
+from pyspark.sql.functions import regexp_extract, col
+
+result = (
+    df.select(
+        regexp_extract(
+            col("application_details"),
+            r'"customerTenureBucket":([0-9]+)',
+            1
+        ).cast("int").alias("customerTenureBucket")
+    )
+    .filter(col("customerTenureBucket").isNotNull())
+    .distinct()
+    .orderBy("customerTenureBucket")
+)
+
+display(result)
