@@ -85,3 +85,10 @@ In the second half, I plan to continue expanding fraud strategy innovation, auto
 ---
 
 This version is much more aligned with what leadership actually reads while still preserving your strongest impact.
+
+
+In the second half of the year, I plan to continue building on the momentum from the first half by focusing on strengthening fraud strategy effectiveness, automation, and portfolio monitoring across the application fraud space. A key priority will be identifying additional fraud mitigation opportunities through data-driven strategy development and faster deployment of high-impact controls across MBNA and TDCT portfolios while balancing fraud detection, false positives, and customer experience.
+
+I also plan to expand automation and monitoring capabilities to further reduce manual effort, improve operational efficiency, and provide faster visibility into portfolio performance and strategy effectiveness. This includes enhancing reporting, monitoring frameworks, and analytical tools that support quicker and more informed business decisions.
+
+Additionally, I aim to continue contributing proactively to emerging fraud threat mitigation by supporting rapid analysis and implementation of tactical controls when required. From a collaboration perspective, I plan to deepen cross-functional partnerships with Operations, Technology, and business stakeholders to accelerate execution of strategic initiatives and improve end-to-end delivery. Overall, my goal is to broaden my impact from strong analytical execution to greater strategic contribution, scalable process improvements, and continued measurable business value.
