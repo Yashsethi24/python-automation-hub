@@ -92,3 +92,31 @@ In the second half of the year, I plan to continue building on the momentum from
 I also plan to expand automation and monitoring capabilities to further reduce manual effort, improve operational efficiency, and provide faster visibility into portfolio performance and strategy effectiveness. This includes enhancing reporting, monitoring frameworks, and analytical tools that support quicker and more informed business decisions.
 
 Additionally, I aim to continue contributing proactively to emerging fraud threat mitigation by supporting rapid analysis and implementation of tactical controls when required. From a collaboration perspective, I plan to deepen cross-functional partnerships with Operations, Technology, and business stakeholders to accelerate execution of strategic initiatives and improve end-to-end delivery. Overall, my goal is to broaden my impact from strong analytical execution to greater strategic contribution, scalable process improvements, and continued measurable business value.
+
+
+This is a good point, but it needs careful phrasing so it sounds like a growth opportunity / communication improvement, not like blaming stakeholders for incomplete information.
+
+A strong version:
+
+> One area where I could improve is ensuring greater upfront clarity on business requirements, context, and expected outcomes at the start of an initiative. While I have been able to deliver strong results across multiple projects, having a more complete understanding of the broader objective and downstream implications earlier in the process would help me think further ahead, anticipate dependencies or risks sooner, and provide even more strategic and well-rounded recommendations to the business.
+
+
+
+A slightly stronger / more polished version:
+
+> One area for improvement is seeking deeper alignment upfront on business context, objectives, and end goals before execution. This would enable me to think more proactively, anticipate next steps and potential dependencies earlier, and provide more strategic recommendations that are better aligned with broader business needs.
+
+
+
+This version is ideal because it says:
+
+you’re proactive
+
+you want more strategic context
+
+you think ahead
+
+you want to improve recommendation quality
+
+
+without sounding defensive.
