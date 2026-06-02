@@ -1,122 +1,13 @@
-Understood. For a mid-year review, this needs to be **executive, concise, high-impact**, not a detailed project dossier.
+The first thing I would like to share is how this fraud trend was identified and how the rule was developed.
 
-Here’s a tighter version that keeps the strongest positioning for a higher ranking.
+This rule is for the MBNA portfolio and is designed to identify applications exhibiting characteristics that, based on our analysis, are associated with elevated fraud risk. The analysis focuses on key application attributes including address city, employment income, occupation, and email address.
 
----
+Before beginning the analysis, I performed data validation to ensure that the data being used was complete, accurate, and suitable for analysis. This included validating the availability and quality of the relevant application fields and confirming that the fraud outcomes were properly captured.
 
-# Mid-Year Self Evaluation
+As part of the analysis, I reviewed historical application data over the selected observation period and examined the relationship between address city, employment income, occupation, and email address patterns and confirmed fraud outcomes. The objective was to identify characteristics and combinations of attributes that demonstrated elevated fraud rates while maintaining an acceptable false positive rate.
 
-## Mid-Year Summary
+I then segmented the population across these attributes and evaluated their performance by calculating key metrics such as fraud rate, capture rate, volume, and false positive rate. This allowed me to assess the risk-reward tradeoff and determine whether the identified patterns were sufficiently predictive to be considered for rule implementation.
 
-Over the first half of the year, I focused on driving measurable business impact across fraud strategy optimization, automation, operational efficiency, fraud risk mitigation, and customer experience improvement across the application fraud portfolios.
+Based on the results of the analysis, the identified characteristics met the criteria for rule development. At this stage, I translated the analytical findings into a rule construct and implemented it as a test rule within FIQM. Using FIQM's testing capabilities, I evaluated the expected performance and impact of the rule on historical data.
 
-I consistently took end-to-end ownership of initiatives—from opportunity identification and analysis through implementation, stakeholder alignment, monitoring, and continuous improvement. My contributions helped strengthen fraud controls, improve portfolio visibility, reduce operational inefficiencies, accelerate analytics, and enable faster response to emerging fraud threats.
-
----
-
-## Key Contributions & Impact
-
-### Fraud Strategy Innovation & Business Impact
-
-Built a reusable fraud strategy development framework across MBNA and TDCT, including a **20+ feature library** and a **decision-tree-based Python framework** to identify missed fraud opportunities and accelerate rule development.
-
-This reduced analysis turnaround from **days to a few hours** and led to deployment of **4+ fraud rules generating CAD 500K+ monthly fraud mitigation impact**.
-
----
-
-### Fraud Strategy Optimization & Operational Efficiency
-
-Conducted rule and queue performance analysis across MBNA, reorganized queue structures based on FPR performance, decommissioned underperforming rules, and expanded auto-block decisioning for high-confidence fraud signals.
-
-This created approximately **80 alerts/day of additional operational capacity**, improved automation, and strengthened fraud decision efficiency while monitoring unblock rates to balance customer impact.
-
----
-
-### VIP Customer Experience Initiative
-
-Partnered with Fraud Operations and Technology teams to improve the fraud review experience for VIP customers by designing a prioritization framework, implementing interim operational solutions ahead of platform releases, and building monitoring for weekly performance tracking.
-
-This improved customer experience while maintaining fraud risk controls.
-
----
-
-### Reporting, Monitoring & Portfolio Visibility
-
-Redesigned the weekly dashboard reporting process by optimizing SQL/Python workflows across Citadel and DSAP, reducing KPI preparation time from **3 hours to under 40 minutes**.
-
-Also took ownership of weekly dashboard reporting and presenting updates to the CPM audience.
-
-Built portfolio monitoring frameworks and reusable data mappings across MBNA and TDCT, reducing analysis time by approximately **90%** and enabling faster access to application, alert, fraud, and operational KPI insights.
-
----
-
-### Proactive Fraud Risk Management
-
-Actively contributed to monitoring emerging fraud trends and ongoing fraud attacks, supporting rapid analysis, mitigation strategy development, and implementation of fraud controls to reduce portfolio exposure.
-
-Also monitored downstream impacts such as unblock rates to assess strategy effectiveness and customer impact.
-
----
-
-### Process Improvement & Team Enablement
-
-Improved team efficiency through automation of recurring BAU reporting using Python, reducing manual effort and improving consistency.
-
-Strengthened knowledge transfer and operational scalability through documentation of FIQM workflows, deployment SOPs, BAU processes, and dependency/request management procedures.
-
----
-
-## Leadership Behaviors Demonstrated
-
-Throughout the period, I consistently demonstrated:
-
-* **Ownership:** drove initiatives end-to-end from ideation to measurable outcomes
-* **Innovation:** built scalable analytical frameworks, automation, and monitoring capabilities
-* **Collaboration:** partnered effectively across Operations, Technology, and business teams
-* **Risk mindset:** balanced fraud mitigation, operational efficiency, and customer experience
-* **Customer focus:** contributed to initiatives improving experience for priority customer segments
-
----
-
-## Focus for Second Half
-
-In the second half, I plan to continue expanding fraud strategy innovation, automation, monitoring capabilities, and portfolio optimization to drive stronger fraud outcomes, operational efficiency, and customer experience improvements.
-
----
-
-This version is much more aligned with what leadership actually reads while still preserving your strongest impact.
-
-
-In the second half of the year, I plan to continue building on the momentum from the first half by focusing on strengthening fraud strategy effectiveness, automation, and portfolio monitoring across the application fraud space. A key priority will be identifying additional fraud mitigation opportunities through data-driven strategy development and faster deployment of high-impact controls across MBNA and TDCT portfolios while balancing fraud detection, false positives, and customer experience.
-
-I also plan to expand automation and monitoring capabilities to further reduce manual effort, improve operational efficiency, and provide faster visibility into portfolio performance and strategy effectiveness. This includes enhancing reporting, monitoring frameworks, and analytical tools that support quicker and more informed business decisions.
-
-Additionally, I aim to continue contributing proactively to emerging fraud threat mitigation by supporting rapid analysis and implementation of tactical controls when required. From a collaboration perspective, I plan to deepen cross-functional partnerships with Operations, Technology, and business stakeholders to accelerate execution of strategic initiatives and improve end-to-end delivery. Overall, my goal is to broaden my impact from strong analytical execution to greater strategic contribution, scalable process improvements, and continued measurable business value.
-
-
-This is a good point, but it needs careful phrasing so it sounds like a growth opportunity / communication improvement, not like blaming stakeholders for incomplete information.
-
-A strong version:
-
-> One area where I could improve is ensuring greater upfront clarity on business requirements, context, and expected outcomes at the start of an initiative. While I have been able to deliver strong results across multiple projects, having a more complete understanding of the broader objective and downstream implications earlier in the process would help me think further ahead, anticipate dependencies or risks sooner, and provide even more strategic and well-rounded recommendations to the business.
-
-
-
-A slightly stronger / more polished version:
-
-> One area for improvement is seeking deeper alignment upfront on business context, objectives, and end goals before execution. This would enable me to think more proactively, anticipate next steps and potential dependencies earlier, and provide more strategic recommendations that are better aligned with broader business needs.
-
-
-
-This version is ideal because it says:
-
-you’re proactive
-
-you want more strategic context
-
-you think ahead
-
-you want to improve recommendation quality
-
-
-without sounding defensive.
+Once the testing results were validated, I completed the required documentation and submitted the rule package for peer review. Following successful peer review, the rule proceeded through the standard governance and implementation process before being considered for production deployment.
