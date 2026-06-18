@@ -1,26 +1,32 @@
-import pandas as pd
-from pathlib import Path
+# Lookup dataframe
+fraud_lookup = final_w_alert_frauds_df[
+    ["application_number", "idxsc100"]
+].drop_duplicates()
 
-txt_folder_path = Path(r"C:\your\txt\folder\path")
+results = []
 
-# Read all pipe-separated txt files
-txt_files = list(txt_folder_path.glob("*.txt"))
+for file_name, df in tdct_dfs.items():
 
-txt_dfs = {}
+    # Merge
+    merged = df.merge(
+        fraud_lookup,
+        on="application_number",
+        how="left"
+    )
 
-for file in txt_files:
-    df_name = file.stem
-    txt_dfs[df_name] = pd.read_csv(file, sep="|", dtype=str)
+    # Convert score to numeric
+    merged["idxsc100"] = pd.to_numeric(
+        merged["idxsc100"],
+        errors="coerce"
+    )
 
-# Combine all txt files into one dataframe
-txt_all = pd.concat(txt_dfs.values(), ignore_index=True)
+    # Store minimum score
+    results.append({
+        "file_name": file_name,
+        "min_idxsc100": merged["idxsc100"].min()
+    })
 
-# Merge with the earlier merged dataset
-final_df = merged_df.merge(
-    txt_all,
-    on="unique_record_ID",
-    how="left"
-)
+# Create summary dataframe
+min_scores_df = pd.DataFrame(results)
 
-print(final_df.shape)
-print(final_df.head())
+print(min_scores_df)
