@@ -1,103 +1,26 @@
-import win32com.client as win32
+import pandas as pd
+from pathlib import Path
 
-OL_FOLDER_INBOX     = 6
-OL_FOLDER_SENTMAIL  = 5
+txt_folder_path = Path(r"C:\your\txt\folder\path")
 
-def _list_child_names(fld):
-    return [f.Name for f in fld.Folders]
+# Read all pipe-separated txt files
+txt_files = list(txt_folder_path.glob("*.txt"))
 
-def resolve_folder_path(ns, path: str):
-    """
-    Resolve a folder by path within the *default mailbox*.
-    Examples:
-      "Inbox"
-      "Sent Items"
-      "Inbox/MBNA test"
-      "Inbox/Reports/2025 Q4"
-    Handles case differences and stray spaces.
-    Raises a descriptive error if any segment isn't found.
-    """
-    # Start at mailbox root (parent of Inbox)
-    root = ns.GetDefaultFolder(OL_FOLDER_INBOX).Parent
-    current = root
+txt_dfs = {}
 
-    # normalize and split
-    segments = [seg.strip() for seg in path.split("/") if seg.strip()]
-    if not segments:
-        raise ValueError("Empty folder path.")
+for file in txt_files:
+    df_name = file.stem
+    txt_dfs[df_name] = pd.read_csv(file, sep="|", dtype=str)
 
-    # Special-case well-known roots to avoid localized names mismatch
-    first = segments[0].lower()
-    if first in ("inbox",):
-        current = ns.GetDefaultFolder(OL_FOLDER_INBOX)
-        segments = segments[1:]  # we already moved into Inbox
-    elif first in ("sent", "sent items"):
-        current = ns.GetDefaultFolder(OL_FOLDER_SENTMAIL)
-        segments = segments[1:]
-    else:
-        # Look up the first segment under mailbox root
-        cand = None
-        for f in current.Folders:
-            if f.Name.strip().lower() == first:
-                cand = f; break
-        if cand is None:
-            raise LookupError(
-                f"Could not find top-level folder '{segments[0]}' under mailbox root.\n"
-                f"Available top-level folders: {', '.join(_list_child_names(current))}"
-            )
-        current = cand
-        segments = segments[1:]
+# Combine all txt files into one dataframe
+txt_all = pd.concat(txt_dfs.values(), ignore_index=True)
 
-    # Walk remaining segments
-    for seg in segments:
-        target = None
-        wanted = seg.strip().lower()
-        for f in current.Folders:
-            if f.Name.strip().lower() == wanted:
-                target = f; break
-        if target is None:
-            raise LookupError(
-                f"Could not find subfolder '{seg}' under '{current.Name}'.\n"
-                f"Siblings here: {', '.join(_list_child_names(current))}"
-            )
-        current = target
+# Merge with the earlier merged dataset
+final_df = merged_df.merge(
+    txt_all,
+    on="unique_record_ID",
+    how="left"
+)
 
-    return current
-
-
-
-def reply_in_thread_with_attachment(subject_hint, attachment_path, reply_all=True, folder="Inbox/MBNA test"):
-    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
-    ns = outlook.Session
-
-    target_folder = resolve_folder_path(ns, folder)
-    # now search & reply inside target_folder
-    import datetime as dt
-    cutoff = (dt.datetime.now() - dt.timedelta(days=60)).strftime("%m/%d/%Y %I:%M %p")
-    items = target_folder.Items.Restrict(f"[SentOn] >= '{cutoff}' or [ReceivedTime] >= '{cutoff}'")
-    items.Sort("[SentOn]", True)
-
-    anchor = None
-    hint = (subject_hint or "").lower()
-    for it in items:
-        if getattr(it, "Class", None) == 43 and hint in ((it.Subject or "").lower()):
-            anchor = it; break
-
-    if not anchor:
-        raise RuntimeError(f"No recent message found with subject containing {subject_hint!r} in {folder!r}")
-
-    reply = anchor.ReplyAll() if reply_all else anchor.Reply()
-    reply.Sensitivity = 3  # olConfidential
-    try:
-        reply.Permission = 2  # olDoNotForward (IRM-enabled tenants only)
-    except Exception:
-        pass
-
-    reply.Subject  = f"[Restricted] {reply.Subject}"
-    reply.HTMLBody = "<p>Attaching the latest report. Please keep internal.</p>" + reply.HTMLBody
-
-    t = reply.UserProperties.Add("TITUSAutomatedClassification", 1)
-    t.Value = "TLPropertyRoot=ABCDE;Classification=For internal use only; Registered to:My Companies;"
-
-    reply.Attachments.Add(attachment_path)
-    reply.Send()
+print(final_df.shape)
+print(final_df.head())
