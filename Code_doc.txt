@@ -1,14 +1,20 @@
 import os
 import re
+import glob
 
 folder_path = r"C:\Your\Folder"
 
+# Step 1: Delete existing CON_EXP files
+for file in glob.glob(os.path.join(folder_path, "CON_EXP*.xlsx")):
+    os.remove(file)
+    print(f"Deleted: {os.path.basename(file)}")
+
+# Step 2: Rename new files
 for filename in os.listdir(folder_path):
 
     if not filename.endswith(".xlsx"):
         continue
 
-    # Find EXP1, EXP2, EXP3, etc.
     match = re.search(r'EXP(\d+)', filename, re.IGNORECASE)
 
     if match:
@@ -21,4 +27,4 @@ for filename in os.listdir(folder_path):
 
         os.rename(old_path, new_path)
 
-        print(f"{filename} -> {new_filename}")
+        print(f"Renamed: {filename} -> {new_filename}")
