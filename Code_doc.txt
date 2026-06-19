@@ -1,30 +1,132 @@
 import os
-import re
-import glob
+import shutil
+from datetime import datetime
+import win32com.client as win32
 
-folder_path = r"C:\Your\Folder"
+folder_path = r"C:\Your\Folder\Path"
 
-# Step 1: Delete existing CON_EXP files
-for file in glob.glob(os.path.join(folder_path, "CON_EXP*.xlsx")):
-    os.remove(file)
-    print(f"Deleted: {os.path.basename(file)}")
+input_file = os.path.join(folder_path, "MBNA supplemental report 20260619.xlsx")
 
-# Step 2: Rename new files
-for filename in os.listdir(folder_path):
+today = datetime.today().strftime("%Y%m%d")
+output_file = os.path.join(folder_path, f"MBNA supplemental report {today}.xlsx")
 
-    if not filename.endswith(".xlsx"):
-        continue
+excel = win32.DispatchEx("Excel.Application")
+excel.Visible = False
+excel.DisplayAlerts = False
 
-    match = re.search(r'EXP(\d+)', filename, re.IGNORECASE)
+try:
+    wb = excel.Workbooks.Open(input_file)
 
-    if match:
-        exp_num = match.group(1)
+    # Refresh all connections, queries, and pivots
+    wb.RefreshAll()
 
-        new_filename = f"CON_EXP{exp_num}.xlsx"
+    # Wait until refresh is complete
+    excel.CalculateUntilAsyncQueriesDone()
 
-        old_path = os.path.join(folder_path, filename)
-        new_path = os.path.join(folder_path, new_filename)
+    # Refresh pivot caches explicitly
+    for ws in wb.Worksheets:
+        for pt in ws.PivotTables():
+            pt.PivotCache().Refresh()
 
-        os.rename(old_path, new_path)
+    # Recalculate workbook
+    excel.CalculateFullRebuild()
 
-        print(f"Renamed: {filename} -> {new_filename}")
+    # Save as today's file
+    wb.SaveAs(output_file)
+
+    wb.Close(SaveChanges=True)
+
+    print(f"Excel refreshed and saved as: {output_file}")
+
+finally:
+    excel.Quit()
+
+
+import os
+from datetime import datetime
+import win32com.client as win32
+
+folder_path = r"C:\Your\Folder\Path"
+
+input_file = os.path.join(folder_path, "MBNA supplemental report 20260619.xlsx")
+
+today = datetime.today().strftime("%Y%m%d")
+today_excel_format = datetime.today().date()
+
+output_file = os.path.join(folder_path, f"MBNA supplemental report {today}.xlsx")
+
+excel = win32.DispatchEx("Excel.Application")
+excel.Visible = False
+excel.DisplayAlerts = False
+
+try:
+    wb = excel.Workbooks.Open(input_file)
+
+    wb.RefreshAll()
+    excel.CalculateUntilAsyncQueriesDone()
+
+    for ws in wb.Worksheets:
+        for pt in ws.PivotTables():
+            pt.PivotCache().Refresh()
+
+    excel.CalculateFullRebuild()
+
+    # Check rpt_prd_end column in each sheet
+    failed_sheets = []
+
+    for ws in wb.Worksheets:
+        used_range = ws.UsedRange
+        rows = used_range.Rows.Count
+        cols = used_range.Columns.Count
+
+        rpt_col = None
+
+        # assuming headers are in row 1
+        for col in range(1, cols + 1):
+            header = ws.Cells(1, col).Value
+            if str(header).strip().lower() == "rpt_prd_end":
+                rpt_col = col
+                break
+
+        if rpt_col is None:
+            failed_sheets.append(f"{ws.Name}: rpt_prd_end column not found")
+            continue
+
+        values_today = False
+
+        for row in range(2, rows + 1):
+            val = ws.Cells(row, rpt_col).Value
+
+            if val is None:
+                continue
+
+            if hasattr(val, "date"):
+                val_date = val.date()
+            else:
+                try:
+                    val_date = datetime.strptime(str(val)[:10], "%Y-%m-%d").date()
+                except:
+                    continue
+
+            if val_date == today_excel_format:
+                values_today = True
+                break
+
+        if not values_today:
+            failed_sheets.append(f"{ws.Name}: today's date not found in rpt_prd_end")
+
+    if failed_sheets:
+        print("Refresh check failed:")
+        for item in failed_sheets:
+            print(item)
+
+        wb.Close(SaveChanges=False)
+
+    else:
+        wb.SaveAs(output_file)
+        wb.Close(SaveChanges=True)
+
+        print(f"Refresh successful. File saved as: {output_file}")
+
+finally:
+    excel.Quit()
