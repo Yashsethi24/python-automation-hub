@@ -1,55 +1,24 @@
-import pandas as pd
-from datetime import datetime
+import os
+import re
 
-historical_file = r"C:\Your\Folder\historical_file.csv"
+folder_path = r"C:\Your\Folder"
 
-hist_df = pd.read_csv(historical_file, dtype=str)
+for filename in os.listdir(folder_path):
 
-# Clean blanks
-hist_df["card_number"] = (
-    hist_df["card_number"]
-    .astype("string")
-    .str.strip()
-    .replace(["", "nan", "None", "NaN"], pd.NA)
-)
+    if not filename.endswith(".xlsx"):
+        continue
 
-# Applications that already have a card at least once
-apps_already_with_card = hist_df.loc[
-    hist_df["card_number"].notna(),
-    "application_number"
-].drop_duplicates()
+    # Find EXP1, EXP2, EXP3, etc.
+    match = re.search(r'EXP(\d+)', filename, re.IGNORECASE)
 
-# Applications that had missing card earlier,
-# but have NEVER received a card yet
-apps_to_check = (
-    hist_df.loc[
-        hist_df["card_number"].isna()
-        & ~hist_df["application_number"].isin(apps_already_with_card),
-        "application_number"
-    ]
-    .drop_duplicates()
-)
+    if match:
+        exp_num = match.group(1)
 
-new_records = []
+        new_filename = f"CON_EXP{exp_num}.xlsx"
 
-for app_num in apps_to_check:
-    card_num = get_card_number(app_num)
+        old_path = os.path.join(folder_path, filename)
+        new_path = os.path.join(folder_path, new_filename)
 
-    if card_num is not None and str(card_num).strip() != "":
-        new_records.append({
-            "application_number": app_num,
-            "card_number": str(card_num).strip(),
-            "run_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
+        os.rename(old_path, new_path)
 
-if new_records:
-    pd.DataFrame(new_records).to_csv(
-        historical_file,
-        mode="a",
-        header=False,
-        index=False
-    )
-
-    print(f"Appended {len(new_records)} newly found card records.")
-else:
-    print("No new card numbers found.")
+        print(f"{filename} -> {new_filename}")
