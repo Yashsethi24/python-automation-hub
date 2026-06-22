@@ -1,132 +1,30 @@
+import pandas as pd
+import math
 import os
-import shutil
-from datetime import datetime
-import win32com.client as win32
 
-folder_path = r"C:\Your\Folder\Path"
+input_file = r"C:\Your\Folder\large_file.xlsx"
+output_folder = r"C:\Your\Folder\Split_Files"
 
-input_file = os.path.join(folder_path, "MBNA supplemental report 20260619.xlsx")
+os.makedirs(output_folder, exist_ok=True)
 
-today = datetime.today().strftime("%Y%m%d")
-output_file = os.path.join(folder_path, f"MBNA supplemental report {today}.xlsx")
+# Read Excel
+df = pd.read_excel(input_file, dtype=str)
 
-excel = win32.DispatchEx("Excel.Application")
-excel.Visible = False
-excel.DisplayAlerts = False
+chunk_size = 9999   # less than 10k records
 
-try:
-    wb = excel.Workbooks.Open(input_file)
+num_files = math.ceil(len(df) / chunk_size)
 
-    # Refresh all connections, queries, and pivots
-    wb.RefreshAll()
+for i in range(num_files):
+    start = i * chunk_size
+    end = start + chunk_size
 
-    # Wait until refresh is complete
-    excel.CalculateUntilAsyncQueriesDone()
+    chunk_df = df.iloc[start:end]
 
-    # Refresh pivot caches explicitly
-    for ws in wb.Worksheets:
-        for pt in ws.PivotTables():
-            pt.PivotCache().Refresh()
+    output_file = os.path.join(
+        output_folder,
+        f"large_file_part_{i+1}.xlsx"
+    )
 
-    # Recalculate workbook
-    excel.CalculateFullRebuild()
+    chunk_df.to_excel(output_file, index=False)
 
-    # Save as today's file
-    wb.SaveAs(output_file)
-
-    wb.Close(SaveChanges=True)
-
-    print(f"Excel refreshed and saved as: {output_file}")
-
-finally:
-    excel.Quit()
-
-
-import os
-from datetime import datetime
-import win32com.client as win32
-
-folder_path = r"C:\Your\Folder\Path"
-
-input_file = os.path.join(folder_path, "MBNA supplemental report 20260619.xlsx")
-
-today = datetime.today().strftime("%Y%m%d")
-today_excel_format = datetime.today().date()
-
-output_file = os.path.join(folder_path, f"MBNA supplemental report {today}.xlsx")
-
-excel = win32.DispatchEx("Excel.Application")
-excel.Visible = False
-excel.DisplayAlerts = False
-
-try:
-    wb = excel.Workbooks.Open(input_file)
-
-    wb.RefreshAll()
-    excel.CalculateUntilAsyncQueriesDone()
-
-    for ws in wb.Worksheets:
-        for pt in ws.PivotTables():
-            pt.PivotCache().Refresh()
-
-    excel.CalculateFullRebuild()
-
-    # Check rpt_prd_end column in each sheet
-    failed_sheets = []
-
-    for ws in wb.Worksheets:
-        used_range = ws.UsedRange
-        rows = used_range.Rows.Count
-        cols = used_range.Columns.Count
-
-        rpt_col = None
-
-        # assuming headers are in row 1
-        for col in range(1, cols + 1):
-            header = ws.Cells(1, col).Value
-            if str(header).strip().lower() == "rpt_prd_end":
-                rpt_col = col
-                break
-
-        if rpt_col is None:
-            failed_sheets.append(f"{ws.Name}: rpt_prd_end column not found")
-            continue
-
-        values_today = False
-
-        for row in range(2, rows + 1):
-            val = ws.Cells(row, rpt_col).Value
-
-            if val is None:
-                continue
-
-            if hasattr(val, "date"):
-                val_date = val.date()
-            else:
-                try:
-                    val_date = datetime.strptime(str(val)[:10], "%Y-%m-%d").date()
-                except:
-                    continue
-
-            if val_date == today_excel_format:
-                values_today = True
-                break
-
-        if not values_today:
-            failed_sheets.append(f"{ws.Name}: today's date not found in rpt_prd_end")
-
-    if failed_sheets:
-        print("Refresh check failed:")
-        for item in failed_sheets:
-            print(item)
-
-        wb.Close(SaveChanges=False)
-
-    else:
-        wb.SaveAs(output_file)
-        wb.Close(SaveChanges=True)
-
-        print(f"Refresh successful. File saved as: {output_file}")
-
-finally:
-    excel.Quit()
+    print(f"Saved {output_file} with {len(chunk_df)} records")
