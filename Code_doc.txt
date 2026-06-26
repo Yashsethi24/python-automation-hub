@@ -1,26 +1,51 @@
-import pandas as pd
-import os
-import glob
+%sql
 
-folder_path = r"C:\Your\Folder"
+WITH alerts AS
+(
+    SELECT *
+    FROM hive_metastore.fiqm.tdct_rt_batch
+    WHERE RULE_DISPLAYNAME = 'Visa App Manual Alerts'
+      AND CREATE_DATE_TIME >= '2026-06-03'
+),
 
-df_list = []
+actions AS
+(
+    SELECT 
+        a.*,
+        b.ACTION_STATUS_CODE,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.APPLICATION_NUMBER
+            ORDER BY b.DATE_UPDATED DESC
+        ) AS rn
+    FROM alerts a
+    LEFT JOIN hive_metastore.fiqm.tdct_rt_action b
+        ON a.APPLICATION_NUMBER = b.APPLICATION_NUMBER
+)
 
-for file in glob.glob(os.path.join(folder_path, "*.txt")):
-    df = pd.read_csv(
-        file,
-        sep="|",
-        dtype=str,          # Read everything as string
-        low_memory=False
-    )
+SELECT 
+    DATE_TRUNC('week', CREATE_DATE_TIME) AS week_start_dt,
+    COUNT(DISTINCT APPLICATION_NUMBER) AS num_alerts,
 
-    # Optional: Add source filename
-    df["source_file"] = os.path.basename(file)
+    COUNT(DISTINCT CASE 
+        WHEN ACTION_STATUS_CODE IN ('H', 'S') 
+        THEN APPLICATION_NUMBER 
+    END) AS num_frauds,
 
-    df_list.append(df)
+    COUNT(DISTINCT CASE 
+        WHEN ACTION_STATUS_CODE IN ('I') 
+        THEN APPLICATION_NUMBER 
+    END) AS num_suspects,
 
-# Concatenate all files
-final_df = pd.concat(df_list, ignore_index=True)
+    ROUND(
+        COUNT(DISTINCT CASE 
+            WHEN ACTION_STATUS_CODE IN ('H', 'S') 
+            THEN APPLICATION_NUMBER 
+        END) * 100.0 
+        / COUNT(DISTINCT APPLICATION_NUMBER),
+        2
+    ) AS fraud_rate_pct
 
-print(f"Files read: {len(df_list)}")
-print(f"Total rows: {len(final_df)}")
+FROM actions
+WHERE rn = 1
+GROUP BY DATE_TRUNC('week', CREATE_DATE_TIME)
+ORDER BY week_start_dt;
