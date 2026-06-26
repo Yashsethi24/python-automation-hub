@@ -165,3 +165,65 @@ message_list_alerts = [
     daily_performance_header,
     daily_perf_html
 ]
+
+
+tdct_weekly_html = (
+    weekly_perf.filter("portfolio='TDCT'")
+    .drop("portfolio")
+    .toPandas()
+    .to_html(index=False)
+)
+
+mbna_weekly_html = (
+    weekly_perf.filter("portfolio='MBNA'")
+    .drop("portfolio")
+    .toPandas()
+    .to_html(index=False)
+)
+
+tdct_daily_html = (
+    daily_perf.filter("portfolio='TDCT'")
+    .drop("portfolio")
+    .toPandas()
+    .to_html(index=False)
+)
+
+mbna_daily_html = (
+    daily_perf.filter("portfolio='MBNA'")
+    .drop("portfolio")
+    .toPandas()
+    .to_html(index=False)
+)
+
+message_list_alerts = [
+    header_alerts,
+    ...,
+    "<h3>Weekly Performance</h3>",
+
+    "<b>TDCT</b>",
+    tdct_weekly_html,
+
+    "<br><br>",
+
+    "<b>MBNA</b>",
+    mbna_weekly_html,
+
+    "<br><hr><br>",
+
+    "<h3>Daily Performance (Last 5 Days)</h3>",
+
+    "<b>TDCT</b>",
+    tdct_daily_html,
+
+    "<br><br>",
+
+    "<b>MBNA</b>",
+    mbna_daily_html,
+
+    "<br><br>",
+    "<b>Score Thresholds</b><br>"
+    "<ul>"
+    "<li>TDCT: Score threshold was <b>243</b> until <b>June 19</b>. From <b>June 20 onward</b>, the tier review strategy uses scores between <b>150 and 300</b>.</li>"
+    "<li>MBNA: Score threshold is <b>270</b>.</li>"
+    "</ul>"
+]
