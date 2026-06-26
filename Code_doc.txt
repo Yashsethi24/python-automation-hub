@@ -3,8 +3,8 @@
 WITH alerts AS
 (
     SELECT *
-    FROM hive_metastore.fiqm.tdct_rt_batch
-    WHERE RULE_DISPLAYNAME = 'Visa App Manual Alerts'
+    FROM hive_metastore.fiqm.tdct_rt_match
+    WHERE TASK_NAME LIKE '%MBNA_QUETS - T1 - Manual Alerts%'
       AND CREATE_DATE_TIME >= '2026-06-03'
 ),
 
@@ -22,33 +22,34 @@ actions AS
         ON a.APPLICATION_NUMBER = b.APPLICATION_NUMBER
 )
 
-SELECT
+SELECT 
     DATE_TRUNC('week', CREATE_DATE_TIME) AS week_start_dt,
+
     COUNT(DISTINCT APPLICATION_NUMBER) AS num_alerts,
 
-    COUNT(DISTINCT CASE
-        WHEN ACTION_STATUS_CODE IN ('H','S')
-        THEN APPLICATION_NUMBER
+    COUNT(DISTINCT CASE 
+        WHEN ACTION_STATUS_CODE IN ('H', 'S') 
+        THEN APPLICATION_NUMBER 
     END) AS num_frauds,
 
-    COUNT(DISTINCT CASE
-        WHEN ACTION_STATUS_CODE = 'I'
-        THEN APPLICATION_NUMBER
+    COUNT(DISTINCT CASE 
+        WHEN ACTION_STATUS_CODE = 'I' 
+        THEN APPLICATION_NUMBER 
     END) AS num_suspects,
 
     ROUND(
         (
             COUNT(DISTINCT APPLICATION_NUMBER)
-            - COUNT(DISTINCT CASE
-                WHEN ACTION_STATUS_CODE IN ('H','S')
-                THEN APPLICATION_NUMBER
+            - COUNT(DISTINCT CASE 
+                WHEN ACTION_STATUS_CODE IN ('H', 'S') 
+                THEN APPLICATION_NUMBER 
             END)
         ) * 1.0
         /
         NULLIF(
-            COUNT(DISTINCT CASE
-                WHEN ACTION_STATUS_CODE IN ('H','S')
-                THEN APPLICATION_NUMBER
+            COUNT(DISTINCT CASE 
+                WHEN ACTION_STATUS_CODE IN ('H', 'S') 
+                THEN APPLICATION_NUMBER 
             END),
             0
         ),
