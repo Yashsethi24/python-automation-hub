@@ -1,15 +1,26 @@
+import pandas as pd
 import os
+import glob
 
 folder_path = r"C:\Your\Folder"
 
-for filename in os.listdir(folder_path):
-    if filename.endswith("fulfill"):
-        base = filename.split(".csv")[0]
-        new_name = base + ".txt"
+df_list = []
 
-        os.rename(
-            os.path.join(folder_path, filename),
-            os.path.join(folder_path, new_name)
-        )
+for file in glob.glob(os.path.join(folder_path, "*.txt")):
+    df = pd.read_csv(
+        file,
+        sep="|",
+        dtype=str,          # Read everything as string
+        low_memory=False
+    )
 
-        print(f"{filename} -> {new_name}")
+    # Optional: Add source filename
+    df["source_file"] = os.path.basename(file)
+
+    df_list.append(df)
+
+# Concatenate all files
+final_df = pd.concat(df_list, ignore_index=True)
+
+print(f"Files read: {len(df_list)}")
+print(f"Total rows: {len(final_df)}")
