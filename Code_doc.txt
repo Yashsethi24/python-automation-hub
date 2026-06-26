@@ -1,11 +1,15 @@
 import os
-import glob
 
 folder_path = r"C:\Your\Folder"
 
-for old_path in glob.glob(os.path.join(folder_path, "*.fulfill")):
-    new_path = old_path[:-8] + ".txt"   # Remove '.fulfill' and add '.txt'
+for filename in os.listdir(folder_path):
+    if filename.endswith("fulfill"):
+        base = filename.split(".csv")[0]
+        new_name = base + ".txt"
 
-    os.rename(old_path, new_path)
+        os.rename(
+            os.path.join(folder_path, filename),
+            os.path.join(folder_path, new_name)
+        )
 
-    print(f"Renamed: {os.path.basename(old_path)} -> {os.path.basename(new_path)}")
+        print(f"{filename} -> {new_name}")
