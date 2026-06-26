@@ -22,28 +22,38 @@ actions AS
         ON a.APPLICATION_NUMBER = b.APPLICATION_NUMBER
 )
 
-SELECT 
+SELECT
     DATE_TRUNC('week', CREATE_DATE_TIME) AS week_start_dt,
     COUNT(DISTINCT APPLICATION_NUMBER) AS num_alerts,
 
-    COUNT(DISTINCT CASE 
-        WHEN ACTION_STATUS_CODE IN ('H', 'S') 
-        THEN APPLICATION_NUMBER 
+    COUNT(DISTINCT CASE
+        WHEN ACTION_STATUS_CODE IN ('H','S')
+        THEN APPLICATION_NUMBER
     END) AS num_frauds,
 
-    COUNT(DISTINCT CASE 
-        WHEN ACTION_STATUS_CODE IN ('I') 
-        THEN APPLICATION_NUMBER 
+    COUNT(DISTINCT CASE
+        WHEN ACTION_STATUS_CODE = 'I'
+        THEN APPLICATION_NUMBER
     END) AS num_suspects,
 
     ROUND(
-        COUNT(DISTINCT CASE 
-            WHEN ACTION_STATUS_CODE IN ('H', 'S') 
-            THEN APPLICATION_NUMBER 
-        END) * 100.0 
-        / COUNT(DISTINCT APPLICATION_NUMBER),
+        (
+            COUNT(DISTINCT APPLICATION_NUMBER)
+            - COUNT(DISTINCT CASE
+                WHEN ACTION_STATUS_CODE IN ('H','S')
+                THEN APPLICATION_NUMBER
+            END)
+        ) * 1.0
+        /
+        NULLIF(
+            COUNT(DISTINCT CASE
+                WHEN ACTION_STATUS_CODE IN ('H','S')
+                THEN APPLICATION_NUMBER
+            END),
+            0
+        ),
         2
-    ) AS fraud_rate_pct
+    ) AS FPR
 
 FROM actions
 WHERE rn = 1
