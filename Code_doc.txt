@@ -1,229 +1,26 @@
-from datetime import datetime
+import pandas as pd
+import os
+import glob
 
-date_now = datetime.today().strftime("%Y-%m-%d")
-minute_now = datetime.today().strftime("%H:%M")
+folder_path = r"C:\Your\Folder"
 
-# -----------------------------
-# Performance SQL
-# -----------------------------
+df_list = []
 
-tdct_perf_sql = """
-WITH alerts AS (
-    SELECT *
-    FROM hive_metastore.fiqm.tdct_rt_match
-    WHERE RULE_DISPLAYNAME = 'Visa App Manual Alerts'
-      AND CREATE_DATE_TIME >= '2026-06-03'
-),
-actions AS (
-    SELECT 
-        a.*,
-        b.ACTION_STATUS_CODE,
-        ROW_NUMBER() OVER (
-            PARTITION BY a.APPLICATION_NUMBER
-            ORDER BY b.DATE_UPDATED DESC
-        ) AS rn
-    FROM alerts a
-    LEFT JOIN hive_metastore.fiqm.tdct_rt_action b
-        ON a.APPLICATION_NUMBER = b.APPLICATION_NUMBER
-)
-SELECT *
-FROM actions
-WHERE rn = 1
-"""
+for file in glob.glob(os.path.join(folder_path, "*.txt")):
+    df = pd.read_csv(
+        file,
+        sep="|",
+        dtype=str,          # Read everything as string
+        low_memory=False
+    )
 
-mbna_perf_sql = """
-WITH alerts AS (
-    SELECT *
-    FROM hive_metastore.fiqm.tdct_rt_match
-    WHERE TASK_NAME LIKE '%MBNA_QUETS - T1 - Manual Alerts%'
-      AND CREATE_DATE_TIME >= '2026-06-03'
-),
-actions AS (
-    SELECT 
-        a.*,
-        b.ACTION_STATUS_CODE,
-        ROW_NUMBER() OVER (
-            PARTITION BY a.APPLICATION_NUMBER
-            ORDER BY b.DATE_UPDATED DESC
-        ) AS rn
-    FROM alerts a
-    LEFT JOIN hive_metastore.fiqm.tdct_rt_action b
-        ON a.APPLICATION_NUMBER = b.APPLICATION_NUMBER
-)
-SELECT *
-FROM actions
-WHERE rn = 1
-"""
+    # Optional: Add source filename
+    df["source_file"] = os.path.basename(file)
 
-tdct_base = spark.sql(tdct_perf_sql)
-mbna_base = spark.sql(mbna_perf_sql)
+    df_list.append(df)
 
-tdct_base.createOrReplaceTempView("tdct_base")
-mbna_base.createOrReplaceTempView("mbna_base")
+# Concatenate all files
+final_df = pd.concat(df_list, ignore_index=True)
 
-
-weekly_perf = spark.sql("""
-SELECT 
-    portfolio,
-    week_start_dt,
-    num_alerts,
-    num_frauds,
-    num_suspects,
-    ROUND((num_alerts - num_frauds) * 1.0 / NULLIF(num_frauds, 0), 2) AS fpr
-FROM (
-    SELECT
-        'TDCT' AS portfolio,
-        DATE_TRUNC('week', CREATE_DATE_TIME) AS week_start_dt,
-        COUNT(DISTINCT APPLICATION_NUMBER) AS num_alerts,
-        COUNT(DISTINCT CASE WHEN ACTION_STATUS_CODE IN ('H','S') THEN APPLICATION_NUMBER END) AS num_frauds,
-        COUNT(DISTINCT CASE WHEN ACTION_STATUS_CODE = 'I' THEN APPLICATION_NUMBER END) AS num_suspects
-    FROM tdct_base
-    GROUP BY DATE_TRUNC('week', CREATE_DATE_TIME)
-
-    UNION ALL
-
-    SELECT
-        'MBNA' AS portfolio,
-        DATE_TRUNC('week', CREATE_DATE_TIME) AS week_start_dt,
-        COUNT(DISTINCT APPLICATION_NUMBER) AS num_alerts,
-        COUNT(DISTINCT CASE WHEN ACTION_STATUS_CODE IN ('H','S') THEN APPLICATION_NUMBER END) AS num_frauds,
-        COUNT(DISTINCT CASE WHEN ACTION_STATUS_CODE = 'I' THEN APPLICATION_NUMBER END) AS num_suspects
-    FROM mbna_base
-    GROUP BY DATE_TRUNC('week', CREATE_DATE_TIME)
-)
-ORDER BY portfolio, week_start_dt
-""")
-
-
-daily_perf = spark.sql("""
-SELECT 
-    portfolio,
-    alert_dt,
-    num_alerts,
-    num_frauds,
-    num_suspects,
-    ROUND((num_alerts - num_frauds) * 1.0 / NULLIF(num_frauds, 0), 2) AS fpr
-FROM (
-    SELECT
-        'TDCT' AS portfolio,
-        DATE(CREATE_DATE_TIME) AS alert_dt,
-        COUNT(DISTINCT APPLICATION_NUMBER) AS num_alerts,
-        COUNT(DISTINCT CASE WHEN ACTION_STATUS_CODE IN ('H','S') THEN APPLICATION_NUMBER END) AS num_frauds,
-        COUNT(DISTINCT CASE WHEN ACTION_STATUS_CODE = 'I' THEN APPLICATION_NUMBER END) AS num_suspects
-    FROM tdct_base
-    WHERE DATE(CREATE_DATE_TIME) >= DATE_SUB(CURRENT_DATE(), 5)
-    GROUP BY DATE(CREATE_DATE_TIME)
-
-    UNION ALL
-
-    SELECT
-        'MBNA' AS portfolio,
-        DATE(CREATE_DATE_TIME) AS alert_dt,
-        COUNT(DISTINCT APPLICATION_NUMBER) AS num_alerts,
-        COUNT(DISTINCT CASE WHEN ACTION_STATUS_CODE IN ('H','S') THEN APPLICATION_NUMBER END) AS num_frauds,
-        COUNT(DISTINCT CASE WHEN ACTION_STATUS_CODE = 'I' THEN APPLICATION_NUMBER END) AS num_suspects
-    FROM mbna_base
-    WHERE DATE(CREATE_DATE_TIME) >= DATE_SUB(CURRENT_DATE(), 5)
-    GROUP BY DATE(CREATE_DATE_TIME)
-)
-ORDER BY portfolio, alert_dt
-""")
-
-
-weekly_perf_html = weekly_perf.toPandas().to_html(index=False)
-daily_perf_html = daily_perf.toPandas().to_html(index=False)
-
-performance_note = """
-<br><br>
-<b>Score Threshold Notes:</b><br>
-<ul>
-    <li><b>TDCT:</b> Score threshold was 243 until June 19. From June 20 onward, tier review strategy is 150–300.</li>
-    <li><b>MBNA:</b> Score threshold is 270.</li>
-</ul>
-
-<br>
-<b>Weekly Performance - TDCT and MBNA</b><br>
-"""
-
-daily_performance_header = """
-<br><br>
-<b>Daily Performance - Last 5 Days - TDCT and MBNA</b><br>
-"""
-
-message_list_alerts = [
-    header_alerts,
-    f"""
-    Hi Team,<br><br>
-    Please find below the new VIP Alerts in FICO. Kindly note that these alerts are to be prioritized above all other alerts.
-    In case the account or card is blocked, please ensure it is unblocked first before processing.
-    Please treat this with utmost urgency and ensure timely action.
-    <br><br>
-    """,
-    non_mon_df_fill_html_alerts,
-    performance_note,
-    weekly_perf_html,
-    daily_performance_header,
-    daily_perf_html
-]
-
-
-tdct_weekly_html = (
-    weekly_perf.filter("portfolio='TDCT'")
-    .drop("portfolio")
-    .toPandas()
-    .to_html(index=False)
-)
-
-mbna_weekly_html = (
-    weekly_perf.filter("portfolio='MBNA'")
-    .drop("portfolio")
-    .toPandas()
-    .to_html(index=False)
-)
-
-tdct_daily_html = (
-    daily_perf.filter("portfolio='TDCT'")
-    .drop("portfolio")
-    .toPandas()
-    .to_html(index=False)
-)
-
-mbna_daily_html = (
-    daily_perf.filter("portfolio='MBNA'")
-    .drop("portfolio")
-    .toPandas()
-    .to_html(index=False)
-)
-
-message_list_alerts = [
-    header_alerts,
-    ...,
-    "<h3>Weekly Performance</h3>",
-
-    "<b>TDCT</b>",
-    tdct_weekly_html,
-
-    "<br><br>",
-
-    "<b>MBNA</b>",
-    mbna_weekly_html,
-
-    "<br><hr><br>",
-
-    "<h3>Daily Performance (Last 5 Days)</h3>",
-
-    "<b>TDCT</b>",
-    tdct_daily_html,
-
-    "<br><br>",
-
-    "<b>MBNA</b>",
-    mbna_daily_html,
-
-    "<br><br>",
-    "<b>Score Thresholds</b><br>"
-    "<ul>"
-    "<li>TDCT: Score threshold was <b>243</b> until <b>June 19</b>. From <b>June 20 onward</b>, the tier review strategy uses scores between <b>150 and 300</b>.</li>"
-    "<li>MBNA: Score threshold is <b>270</b>.</li>"
-    "</ul>"
-]
+print(f"Files read: {len(df_list)}")
+print(f"Total rows: {len(final_df)}")
