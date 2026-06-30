@@ -1,26 +1,485 @@
-import pandas as pd
-import os
-import glob
+-- ============================================================
+-- MBNA Dynamic Queue Performance - Databricks SQL
+-- Source tables:
+-- hive_metastore.fiqm.applications
+-- hive_metastore.fiqm.tdct_rt_action
+-- hive_metastore.fiqm.tdct_rt_match
+-- ============================================================
 
-folder_path = r"C:\Your\Folder"
+-- 1. Date parameters: previous completed month
+CREATE OR REPLACE TEMP VIEW params AS
+SELECT
+    add_months(date_trunc('MONTH', current_date()), -1) AS start_date,
+    date_trunc('MONTH', current_date()) AS end_date
+;
 
-df_list = []
+-- Check dates
+SELECT * FROM params;
 
-for file in glob.glob(os.path.join(folder_path, "*.txt")):
-    df = pd.read_csv(
-        file,
-        sep="|",
-        dtype=str,          # Read everything as string
-        low_memory=False
-    )
 
-    # Optional: Add source filename
-    df["source_file"] = os.path.basename(file)
+-- ============================================================
+-- 2. Dynamic queue/rule mapping
+-- ============================================================
 
-    df_list.append(df)
+CREATE OR REPLACE TEMP VIEW rc_mbna_rules AS
+SELECT DISTINCT
+    lpad(CAST(dense_rank() OVER (ORDER BY task_name) AS STRING), 2, '0') AS queue_priority,
+    task_name AS queue_name,
+    rule_name,
+    'MBNA' AS product_group
+FROM hive_metastore.fiqm.tdct_rt_match a
+CROSS JOIN params p
+WHERE a.task_name LIKE '%MBNA%'
+  AND a.rule_name NOT LIKE 'PRCS%'
+  AND a.create_date_time >= p.start_date
+  AND a.create_date_time <  p.end_date
+  AND a.rule_name IS NOT NULL
+  AND a.task_name IS NOT NULL
+;
 
-# Concatenate all files
-final_df = pd.concat(df_list, ignore_index=True)
 
-print(f"Files read: {len(df_list)}")
-print(f"Total rows: {len(final_df)}")
+-- ============================================================
+-- 3. Previous action before reporting period
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_actions_before AS
+SELECT
+    c.application_number,
+    MAX(c.date_updated) AS date_updated
+FROM hive_metastore.fiqm.tdct_rt_action c
+CROSS JOIN params p
+WHERE c.date_updated < p.start_date
+GROUP BY c.application_number
+;
+
+
+-- ============================================================
+-- 4. Current-period latest action
+-- exclude applications already acted before period
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_actions AS
+SELECT
+    c.application_number,
+    MAX(c.date_updated) AS date_updated
+FROM hive_metastore.fiqm.tdct_rt_action c
+CROSS JOIN params p
+WHERE c.date_updated >= p.start_date
+  AND c.date_updated <  p.end_date
+  AND NOT EXISTS (
+      SELECT 1
+      FROM rc_actions_before d
+      WHERE d.application_number = c.application_number
+  )
+GROUP BY c.application_number
+;
+
+
+-- ============================================================
+-- 5. MBNA applications
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_mbna_apps AS
+SELECT
+    a.*,
+    CASE
+        WHEN application_number RLIKE '^[A-E]' THEN 'MBNA'
+        ELSE NULL
+    END AS product_group
+FROM hive_metastore.fiqm.applications a
+WHERE application_number RLIKE '^[A-E]'
+;
+
+
+-- ============================================================
+-- 6. Raw MBNA rule hits
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_temp_mbna_rulehits AS
+SELECT
+    a.*,
+    CAST(a.create_date_time AS DATE) AS alert_date
+FROM hive_metastore.fiqm.tdct_rt_match a
+CROSS JOIN params p
+WHERE a.rule_name NOT LIKE 'W_%'
+  AND a.create_date_time >= p.start_date
+  AND a.create_date_time <  p.end_date
+  AND a.application_number RLIKE '^[A-E]'
+  AND a.task_name LIKE '%MBNA%'
+;
+
+
+-- ============================================================
+-- 7. Add dynamic queue flags
+-- This replaces hardcoded NEW_P1, NEW_P2, etc.
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_temp_mbna_rulehits_2 AS
+SELECT
+    a.*,
+    b.queue_priority,
+    b.queue_name,
+    CASE WHEN b.queue_name IS NOT NULL THEN 1 ELSE 0 END AS queue_hit
+FROM rc_temp_mbna_rulehits a
+LEFT JOIN rc_mbna_rules b
+    ON a.rule_name = b.rule_name
+;
+
+
+-- ============================================================
+-- 8. Determine final queue per application/date
+-- If multiple rules hit same app/date, choose lowest queue_priority
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_temp_mbna_rulehits_3 AS
+SELECT
+    application_number,
+    CAST(create_date_time AS DATE) AS alert_date,
+    MIN(queue_priority) AS final_queue_priority
+FROM rc_temp_mbna_rulehits_2
+WHERE queue_priority IS NOT NULL
+GROUP BY application_number, CAST(create_date_time AS DATE)
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_temp_mbna_rulehits_4 AS
+SELECT DISTINCT
+    a.application_number,
+    a.alert_date,
+    a.final_queue_priority,
+    b.queue_name AS temp_task_name
+FROM rc_temp_mbna_rulehits_3 a
+LEFT JOIN rc_mbna_rules b
+    ON a.final_queue_priority = b.queue_priority
+;
+
+
+-- ============================================================
+-- 9. Rulehit base table
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_mbna_rulehits_base AS
+SELECT
+    a.*,
+    b.temp_task_name,
+    CASE
+        WHEN a.task_name IS NOT NULL THEN a.task_name
+        WHEN b.temp_task_name IS NOT NULL THEN b.temp_task_name
+        ELSE a.task_name
+    END AS new_task_name
+FROM rc_temp_mbna_rulehits a
+LEFT JOIN rc_temp_mbna_rulehits_4 b
+    ON a.application_number = b.application_number
+   AND CAST(a.create_date_time AS DATE) = b.alert_date
+WHERE b.temp_task_name IS NOT NULL
+;
+
+
+-- ============================================================
+-- 10. Queue performance
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_queue_performance_temp AS
+SELECT
+    b.new_task_name,
+
+    COUNT(DISTINCT CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))) AS queue_alert,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CN', 'I', 'H')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_worked,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CN')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_clear_noinvestigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_possible_fraud,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_clear_after_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('I')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_under_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P', 'CA', 'H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_fully_investigated,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_confirmed_fraud,
+
+    COUNT(DISTINCT a.application_number) AS unique_alerted_application,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CN', 'I', 'H')
+        THEN a.application_number END) AS customer_worked,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CN')
+        THEN a.application_number END) AS customer_clear_noinvestigation,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('P')
+        THEN a.application_number END) AS customer_possible_fraud,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CA')
+        THEN a.application_number END) AS customer_clear_after_investigation,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('I')
+        THEN a.application_number END) AS customer_clear_under_investigation,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('P', 'CN', 'H', 'S')
+        THEN a.application_number END) AS customer_fully_investigated,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('H', 'S')
+        THEN a.application_number END) AS customer_confirmed_fraud
+
+FROM hive_metastore.fiqm.tdct_rt_match a
+LEFT JOIN rc_mbna_rulehits_base b
+    ON a.application_number = b.application_number
+LEFT JOIN rc_actions c
+    ON a.application_number = c.application_number
+LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+    ON c.application_number = d.application_number
+   AND c.date_updated = d.date_updated
+LEFT JOIN rc_mbna_rules e
+    ON b.rule_name = e.rule_name
+CROSS JOIN params p
+WHERE a.task_name LIKE '%MBNA%'
+  AND a.rule_name NOT LIKE 'PRCS%'
+  AND e.rule_name IS NOT NULL
+  AND b.create_date_time >= p.start_date
+  AND b.create_date_time <  p.end_date
+  AND b.new_task_name IS NOT NULL
+  AND a.application_number RLIKE '^[A-E]'
+GROUP BY b.new_task_name
+;
+
+
+-- ============================================================
+-- 11. Queue exposure
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_queue_exposure_temp AS
+SELECT
+    t2.new_task_name,
+    COUNT(DISTINCT t2.application_number) AS fraud_count,
+    SUM(t2.saved_value) AS averted_exposure
+FROM (
+    SELECT DISTINCT
+        t1.new_task_name,
+        t1.application_number,
+        t1.saved_value
+    FROM (
+        SELECT
+            b.new_task_name,
+            a.application_number,
+            d.saved_value
+        FROM hive_metastore.fiqm.tdct_rt_match a
+        LEFT JOIN rc_mbna_rulehits_base b
+            ON a.application_number = b.application_number
+        LEFT JOIN rc_actions c
+            ON a.application_number = c.application_number
+        LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+            ON c.application_number = d.application_number
+           AND c.date_updated = d.date_updated
+        LEFT JOIN rc_mbna_rules e
+            ON b.rule_name = e.rule_name
+        CROSS JOIN params p
+        WHERE a.task_name LIKE '%MBNA%'
+          AND a.rule_name NOT LIKE 'PRCS%'
+          AND e.rule_name IS NOT NULL
+          AND b.create_date_time >= p.start_date
+          AND b.create_date_time <  p.end_date
+          AND d.action_status_code IN ('H', 'S')
+          AND a.application_number RLIKE '^[A-E]'
+    ) t1
+) t2
+GROUP BY t2.new_task_name
+;
+
+
+-- ============================================================
+-- 12. Final queue performance output
+-- ============================================================
+
+SELECT
+    r.queue_priority,
+    b.new_task_name,
+
+    COALESCE(b.queue_alert, 0) AS queue_alert,
+    CAST(COALESCE(b.queue_alert, 0) / 20.0 AS DECIMAL(18,1)) AS alerts_per_day,
+
+    COALESCE(b.queue_worked, 0) AS queue_worked,
+    COALESCE(b.queue_clear_noinvestigation, 0) AS queue_clear_noinvestigation,
+    COALESCE(b.queue_possible_fraud, 0) AS queue_possible_fraud,
+    COALESCE(b.queue_clear_after_investigation, 0) AS queue_clear_after_investigation,
+    COALESCE(b.queue_under_investigation, 0) AS queue_under_investigation,
+    COALESCE(b.queue_fully_investigated, 0) AS queue_fully_investigated,
+    COALESCE(b.queue_confirmed_fraud, 0) AS queue_confirmed_fraud,
+
+    COALESCE(b.unique_alerted_application, 0) AS unique_alerted_application,
+    COALESCE(b.customer_confirmed_fraud, 0) AS customer_confirmed_fraud,
+    COALESCE(b.customer_worked, 0) AS customer_worked,
+    COALESCE(b.customer_fully_investigated, 0) AS customer_fully_investigated,
+    COALESCE(c.averted_exposure, 0) AS averted_exposure,
+
+    CASE
+        WHEN b.customer_confirmed_fraud = 0 THEN 'NA'
+        ELSE CONCAT(CAST((b.unique_alerted_application / b.customer_confirmed_fraud) - 1 AS STRING), ':1')
+    END AS queue_fpr,
+
+    CASE
+        WHEN b.customer_confirmed_fraud = 0 THEN 'NA'
+        ELSE CONCAT(CAST((b.customer_worked / b.customer_confirmed_fraud) - 1 AS STRING), ':1')
+    END AS worked_fpr,
+
+    CASE
+        WHEN b.customer_confirmed_fraud = 0 THEN 'NA'
+        ELSE CONCAT(CAST((b.customer_fully_investigated / b.customer_confirmed_fraud) - 1 AS STRING), ':1')
+    END AS customer_fpr
+
+FROM rc_queue_performance_temp b
+LEFT JOIN rc_queue_exposure_temp c
+    ON b.new_task_name = c.new_task_name
+LEFT JOIN (
+    SELECT queue_name, MIN(queue_priority) AS queue_priority
+    FROM rc_mbna_rules
+    GROUP BY queue_name
+) r
+    ON b.new_task_name = r.queue_name
+ORDER BY r.queue_priority, b.new_task_name
+;
+
+
+-- ============================================================
+-- 13. Total performance
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW rc_total_performance_temp AS
+SELECT
+    'TOTAL PERFORMANCE' AS new_task_name,
+
+    COUNT(DISTINCT CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))) AS queue_alert,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CN', 'I', 'H')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_worked,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(a.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_confirmed_fraud,
+
+    COUNT(DISTINCT a.application_number) AS unique_alerted_application,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CN', 'I', 'H')
+        THEN a.application_number END) AS customer_worked,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('P', 'CN', 'H', 'S')
+        THEN a.application_number END) AS customer_fully_investigated,
+
+    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('H', 'S')
+        THEN a.application_number END) AS customer_confirmed_fraud
+
+FROM hive_metastore.fiqm.tdct_rt_match a
+LEFT JOIN rc_mbna_rulehits_base b
+    ON a.application_number = b.application_number
+LEFT JOIN rc_actions c
+    ON a.application_number = c.application_number
+LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+    ON c.application_number = d.application_number
+   AND c.date_updated = d.date_updated
+LEFT JOIN rc_mbna_rules e
+    ON b.rule_name = e.rule_name
+CROSS JOIN params p
+WHERE a.task_name LIKE '%MBNA%'
+  AND a.rule_name NOT LIKE 'PRCS%'
+  AND e.rule_name IS NOT NULL
+  AND b.create_date_time >= p.start_date
+  AND b.create_date_time <  p.end_date
+  AND b.new_task_name IS NOT NULL
+  AND a.application_number RLIKE '^[A-E]'
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_total_exposure_temp AS
+SELECT
+    'TOTAL PERFORMANCE' AS new_task_name,
+    COUNT(DISTINCT t2.application_number) AS fraud_count,
+    SUM(t2.saved_value) AS averted_exposure
+FROM (
+    SELECT DISTINCT
+        a.application_number,
+        d.saved_value
+    FROM hive_metastore.fiqm.tdct_rt_match a
+    LEFT JOIN rc_mbna_rulehits_base b
+        ON a.application_number = b.application_number
+    LEFT JOIN rc_actions c
+        ON a.application_number = c.application_number
+    LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+        ON c.application_number = d.application_number
+       AND c.date_updated = d.date_updated
+    LEFT JOIN rc_mbna_rules e
+        ON b.rule_name = e.rule_name
+    CROSS JOIN params p
+    WHERE a.task_name LIKE '%MBNA%'
+      AND a.rule_name NOT LIKE 'PRCS%'
+      AND e.rule_name IS NOT NULL
+      AND b.create_date_time >= p.start_date
+      AND b.create_date_time <  p.end_date
+      AND d.action_status_code IN ('H', 'S')
+      AND a.application_number RLIKE '^[A-E]'
+) t2
+;
+
+
+-- ============================================================
+-- 14. Final total performance output
+-- ============================================================
+
+SELECT
+    a.new_task_name,
+
+    COALESCE(a.queue_alert, 0) AS queue_alert,
+    CAST(COALESCE(a.queue_alert, 0) / 20.0 AS DECIMAL(18,1)) AS alerts_per_day,
+
+    COALESCE(a.queue_worked, 0) AS queue_worked,
+    COALESCE(a.queue_confirmed_fraud, 0) AS queue_confirmed_fraud,
+
+    COALESCE(a.unique_alerted_application, 0) AS unique_alerted_application,
+    COALESCE(a.customer_confirmed_fraud, 0) AS customer_confirmed_fraud,
+    COALESCE(a.customer_worked, 0) AS customer_worked,
+    COALESCE(a.customer_fully_investigated, 0) AS customer_fully_investigated,
+
+    COALESCE(b.averted_exposure, 0) AS averted_exposure,
+
+    CASE
+        WHEN a.customer_confirmed_fraud = 0 THEN 'NA'
+        ELSE CONCAT(CAST((a.unique_alerted_application / a.customer_confirmed_fraud) - 1 AS STRING), ':1')
+    END AS queue_fpr,
+
+    CASE
+        WHEN a.customer_confirmed_fraud = 0 THEN 'NA'
+        ELSE CONCAT(CAST((a.customer_worked / a.customer_confirmed_fraud) - 1 AS STRING), ':1')
+    END AS worked_fpr,
+
+    CASE
+        WHEN a.customer_confirmed_fraud = 0 THEN 'NA'
+        ELSE CONCAT(CAST((a.customer_fully_investigated / a.customer_confirmed_fraud) - 1 AS STRING), ':1')
+    END AS customer_fpr
+
+FROM rc_total_performance_temp a
+LEFT JOIN rc_total_exposure_temp b
+    ON a.new_task_name = b.new_task_name
+;
