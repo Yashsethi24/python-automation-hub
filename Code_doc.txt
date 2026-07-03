@@ -1,36 +1,594 @@
 import pandas as pd
-import glob
-import os
 
-folder_path = r"C:\Your\Folder"
+mapping_path = "/Workspace/Users/yash.sethi@td.com/IFAD to DSAP Script Migration/TDCT_queue_rules.csv"
 
-# -----------------------------
-# Read all EOD_income files
-# -----------------------------
-income_files = sorted(
-    glob.glob(os.path.join(folder_path, "*EOD_income*.xlsx"))
+pdf = pd.read_csv(mapping_path)
+
+pdf = (
+    pdf[["Queue", "rule_name"]]
+    .dropna(subset=["Queue", "rule_name"])
+    .drop_duplicates()
 )
 
-income_df = pd.concat(
-    [pd.read_excel(f, dtype=str) for f in income_files],
-    ignore_index=True
-)
+df_rules = spark.createDataFrame(pdf)
 
-print(f"Income files read: {len(income_files)}")
-print(f"Income rows: {len(income_df)}")
+df_rules.createOrReplaceTempView("rc_tdct_rules_raw")
 
 
-# -----------------------------
-# Read all EOD_address_match files
-# -----------------------------
-address_files = sorted(
-    glob.glob(os.path.join(folder_path, "*EOD_address_match*.xlsx"))
-)
 
-address_df = pd.concat(
-    [pd.read_excel(f, dtype=str) for f in address_files],
-    ignore_index=True
-)
 
-print(f"Address files read: {len(address_files)}")
-print(f"Address rows: {len(address_df)}")
+CREATE OR REPLACE TEMP VIEW params AS
+SELECT
+    add_months(date_trunc('MONTH', current_date()), -1) AS start_date,
+    date_trunc('MONTH', current_date()) AS end_date
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_cc_rules AS
+SELECT
+    lpad(CAST(dense_rank() OVER (ORDER BY Queue) AS STRING), 2, '0') AS queue_priority,
+    Queue AS queue_name,
+    rule_name,
+    '1. TDCC' AS product_group
+FROM rc_tdct_rules_raw
+WHERE Queue IS NOT NULL
+  AND rule_name IS NOT NULL
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_actions_before AS
+SELECT
+    a.application_number,
+    regexp_replace(regexp_replace(a.application_number, 'R', ''), 'P', '') AS modified_app_no,
+    MAX(a.date_updated) AS date_updated
+FROM hive_metastore.fiqm.tdct_rt_action a
+CROSS JOIN params p
+WHERE a.date_updated < p.start_date
+GROUP BY
+    a.application_number,
+    regexp_replace(regexp_replace(a.application_number, 'R', ''), 'P', '')
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_actions AS
+SELECT
+    a.application_number,
+    regexp_replace(regexp_replace(a.application_number, 'R', ''), 'P', '') AS modified_app_no,
+    MAX(a.date_updated) AS date_updated
+FROM hive_metastore.fiqm.tdct_rt_action a
+CROSS JOIN params p
+WHERE a.date_updated >= p.start_date
+  AND NOT EXISTS (
+      SELECT 1
+      FROM rc_actions_before b
+      WHERE b.application_number =
+            regexp_replace(regexp_replace(a.application_number, 'R', ''), 'P', '')
+  )
+GROUP BY
+    a.application_number,
+    regexp_replace(regexp_replace(a.application_number, 'R', ''), 'P', '')
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_cc_apps AS
+SELECT
+    CASE
+        WHEN product_type IN ('PUCC', 'PSCC') THEN '1. TDCC'
+    END AS product_group,
+    *
+FROM hive_metastore.fiqm.applications
+WHERE product_type IN ('PUCC', 'PSCC')
+  AND application_number NOT LIKE 'A%'
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_temp_tdct_rulehits AS
+SELECT
+    a.*,
+    CAST(a.create_date_time AS DATE) AS alert_date,
+    b.application_number AS app_no2
+FROM hive_metastore.fiqm.tdct_rt_match a
+FULL OUTER JOIN rc_cc_apps b
+    ON regexp_replace(regexp_replace(a.application_number, 'R', ''), 'P', '') = b.application_number
+CROSS JOIN params p
+WHERE a.rule_name NOT LIKE 'W_%'
+  AND a.create_date_time >= p.start_date
+  AND a.create_date_time < p.end_date
+  AND a.rule_name NOT LIKE 'PRC%'
+  AND (
+        a.application_number LIKE '3%'
+        OR a.application_number LIKE 'R%'
+      )
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_temp_tdct_rulehits_2 AS
+SELECT
+    a.*,
+    b.queue_priority,
+    b.queue_name
+FROM rc_temp_tdct_rulehits a
+LEFT JOIN rc_cc_rules b
+    ON a.rule_name = b.rule_name
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_temp_tdct_rulehits_3 AS
+SELECT
+    application_number,
+    CAST(create_date_time AS DATE) AS create_date_time,
+    MIN(queue_priority) AS final_queue_priority
+FROM rc_temp_tdct_rulehits_2
+WHERE queue_priority IS NOT NULL
+GROUP BY
+    application_number,
+    CAST(create_date_time AS DATE)
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_temp_tdct_rulehits_4 AS
+SELECT DISTINCT
+    a.application_number,
+    a.create_date_time,
+    a.final_queue_priority,
+    b.queue_name AS temp_task_name
+FROM rc_temp_tdct_rulehits_3 a
+LEFT JOIN rc_cc_rules b
+    ON a.final_queue_priority = b.queue_priority
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_tdct_rulehits_base AS
+SELECT
+    a.*,
+    b.temp_task_name,
+    CASE
+        WHEN a.task_name IS NOT NULL AND a.task_name <> '' THEN a.task_name
+        ELSE b.temp_task_name
+    END AS new_task_name
+FROM rc_temp_tdct_rulehits a
+LEFT JOIN rc_temp_tdct_rulehits_4 b
+    ON a.application_number = b.application_number
+   AND CAST(a.create_date_time AS DATE) = b.create_date_time
+WHERE b.temp_task_name IS NOT NULL
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_queue_performance_temp AS
+SELECT
+    b.new_task_name,
+
+    COUNT(DISTINCT CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))) AS queue_alert,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA', 'CN', 'H', 'S', 'P')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_worked,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CN')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_clear_noinvestigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_possible_fraud,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_clear_after_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('I')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_under_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P', 'CA', 'H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_fully_investigated,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_confirmed_fraud,
+
+    COUNT(DISTINCT a.application_number) AS unique_alerted_application,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA', 'CN', 'H', 'S', 'P')
+        THEN a.application_number
+    END) AS customer_worked,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CN')
+        THEN a.application_number
+    END) AS customer_clear_noinvestigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P')
+        THEN a.application_number
+    END) AS customer_possible_fraud,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA')
+        THEN a.application_number
+    END) AS customer_clear_after_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('I')
+        THEN a.application_number
+    END) AS customer_clear_under_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P', 'CA', 'H', 'S')
+        THEN a.application_number
+    END) AS customer_fully_investigated,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('H', 'S')
+        THEN a.application_number
+    END) AS customer_confirmed_fraud
+
+FROM rc_cc_apps a
+LEFT JOIN rc_tdct_rulehits_base b
+    ON a.application_number = b.app_no2
+LEFT JOIN rc_actions c
+    ON a.application_number = c.modified_app_no
+LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+    ON regexp_replace(regexp_replace(c.application_number, 'R', ''), 'P', '')
+     = regexp_replace(regexp_replace(d.application_number, 'R', ''), 'P', '')
+   AND c.date_updated = d.date_updated
+LEFT JOIN rc_cc_rules e
+    ON b.rule_name = e.rule_name
+CROSS JOIN params p
+WHERE a.product_type IN ('PUCC', 'PSCC')
+  AND e.rule_name IS NOT NULL
+  AND b.create_date_time >= p.start_date
+  AND b.create_date_time < p.end_date
+GROUP BY b.new_task_name
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_queue_exposure_temp AS
+SELECT
+    t2.new_task_name,
+    COUNT(DISTINCT t2.application_number) AS fraud_count,
+    SUM(t2.saved_value) AS averted_exposure
+FROM (
+    SELECT DISTINCT
+        t1.new_task_name,
+        t1.application_number,
+        t1.saved_value
+    FROM (
+        SELECT
+            b.new_task_name,
+            a.application_number,
+            d.saved_value
+        FROM rc_cc_apps a
+        LEFT JOIN rc_tdct_rulehits_base b
+            ON a.application_number = b.app_no2
+        LEFT JOIN rc_actions c
+            ON a.application_number = c.modified_app_no
+        LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+            ON regexp_replace(regexp_replace(c.application_number, 'R', ''), 'P', '')
+             = regexp_replace(regexp_replace(d.application_number, 'R', ''), 'P', '')
+           AND c.date_updated = d.date_updated
+        LEFT JOIN rc_cc_rules e
+            ON b.rule_name = e.rule_name
+        CROSS JOIN params p
+        WHERE a.product_type IN ('PUCC', 'PSCC')
+          AND e.rule_name IS NOT NULL
+          AND b.create_date_time >= p.start_date
+          AND b.create_date_time < p.end_date
+          AND d.action_status_code IN ('H', 'S')
+    ) t1
+) t2
+GROUP BY t2.new_task_name
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_tier_performance_temp AS
+SELECT
+    CASE
+        WHEN b.new_task_name LIKE '%T1%' THEN 'VISA TIER 1'
+        WHEN b.new_task_name LIKE '%T2%' THEN 'VISA TIER 2'
+        WHEN b.new_task_name LIKE '%T3%' THEN 'VISA TIER 3'
+        ELSE 'NOT IN ANY TIER'
+    END AS tier,
+
+    COUNT(DISTINCT CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))) AS queue_alert,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA', 'CN', 'H', 'S', 'P')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_worked,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CN')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_clear_noinvestigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_possible_fraud,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_clear_after_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('I')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_under_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P', 'CA', 'H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_fully_investigated,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_confirmed_fraud,
+
+    COUNT(DISTINCT a.application_number) AS unique_alerted_application,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA', 'CN', 'H', 'S', 'P')
+        THEN a.application_number
+    END) AS customer_worked,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CN')
+        THEN a.application_number
+    END) AS customer_clear_noinvestigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P')
+        THEN a.application_number
+    END) AS customer_possible_fraud,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA')
+        THEN a.application_number
+    END) AS customer_clear_after_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('I')
+        THEN a.application_number
+    END) AS customer_clear_under_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P', 'CA', 'H', 'S')
+        THEN a.application_number
+    END) AS customer_fully_investigated,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('H', 'S')
+        THEN a.application_number
+    END) AS customer_confirmed_fraud
+
+FROM rc_cc_apps a
+LEFT JOIN rc_tdct_rulehits_base b
+    ON a.application_number = b.app_no2
+LEFT JOIN rc_actions c
+    ON a.application_number = c.modified_app_no
+LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+    ON regexp_replace(regexp_replace(c.application_number, 'R', ''), 'P', '')
+     = regexp_replace(regexp_replace(d.application_number, 'R', ''), 'P', '')
+   AND c.date_updated = d.date_updated
+LEFT JOIN rc_cc_rules e
+    ON b.rule_name = e.rule_name
+CROSS JOIN params p
+WHERE a.product_type IN ('PUCC', 'PSCC')
+  AND e.rule_name IS NOT NULL
+  AND b.create_date_time >= p.start_date
+  AND b.create_date_time < p.end_date
+GROUP BY
+    CASE
+        WHEN b.new_task_name LIKE '%T1%' THEN 'VISA TIER 1'
+        WHEN b.new_task_name LIKE '%T2%' THEN 'VISA TIER 2'
+        WHEN b.new_task_name LIKE '%T3%' THEN 'VISA TIER 3'
+        ELSE 'NOT IN ANY TIER'
+    END
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_tier_exposure_temp AS
+SELECT
+    t2.tier,
+    COUNT(DISTINCT t2.application_number) AS fraud_count,
+    SUM(t2.saved_value) AS averted_exposure
+FROM (
+    SELECT DISTINCT
+        CASE
+            WHEN b.new_task_name LIKE '%T1%' THEN 'VISA TIER 1'
+            WHEN b.new_task_name LIKE '%T2%' THEN 'VISA TIER 2'
+            WHEN b.new_task_name LIKE '%T3%' THEN 'VISA TIER 3'
+            ELSE 'NOT IN ANY TIER'
+        END AS tier,
+        a.application_number,
+        d.saved_value
+    FROM rc_cc_apps a
+    LEFT JOIN rc_tdct_rulehits_base b
+        ON a.application_number = b.app_no2
+    LEFT JOIN rc_actions c
+        ON a.application_number = c.modified_app_no
+    LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+        ON regexp_replace(regexp_replace(c.application_number, 'R', ''), 'P', '')
+         = regexp_replace(regexp_replace(d.application_number, 'R', ''), 'P', '')
+       AND c.date_updated = d.date_updated
+    LEFT JOIN rc_cc_rules e
+        ON b.rule_name = e.rule_name
+    CROSS JOIN params p
+    WHERE a.product_type IN ('PUCC', 'PSCC')
+      AND e.rule_name IS NOT NULL
+      AND b.create_date_time >= p.start_date
+      AND b.create_date_time < p.end_date
+      AND d.action_status_code IN ('H', 'S')
+) t2
+GROUP BY t2.tier
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_total_performance_temp AS
+SELECT
+    'TOTAL PERFORMANCE' AS new_task_name,
+
+    COUNT(DISTINCT CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))) AS queue_alert,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA', 'CN', 'H', 'S', 'P')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_worked,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CN')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_clear_noinvestigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_possible_fraud,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_clear_after_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('I')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_under_investigation,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P', 'CA', 'H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_fully_investigated,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('H', 'S')
+        THEN CONCAT(CAST(a.application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
+    END) AS queue_confirmed_fraud,
+
+    COUNT(DISTINCT a.application_number) AS unique_alerted_application,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('CA', 'CN', 'H', 'S', 'P')
+        THEN a.application_number
+    END) AS customer_worked,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('P', 'CA', 'H', 'S')
+        THEN a.application_number
+    END) AS customer_fully_investigated,
+
+    COUNT(DISTINCT CASE
+        WHEN d.action_status_code IN ('H', 'S')
+        THEN a.application_number
+    END) AS customer_confirmed_fraud
+
+FROM rc_cc_apps a
+LEFT JOIN rc_tdct_rulehits_base b
+    ON a.application_number = b.app_no2
+LEFT JOIN rc_actions c
+    ON a.application_number = c.modified_app_no
+LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+    ON regexp_replace(regexp_replace(c.application_number, 'R', ''), 'P', '')
+     = regexp_replace(regexp_replace(d.application_number, 'R', ''), 'P', '')
+   AND c.date_updated = d.date_updated
+LEFT JOIN rc_cc_rules e
+    ON b.rule_name = e.rule_name
+CROSS JOIN params p
+WHERE a.product_type IN ('PUCC', 'PSCC')
+  AND e.rule_name IS NOT NULL
+  AND b.create_date_time >= p.start_date
+  AND b.create_date_time < p.end_date
+;
+
+
+CREATE OR REPLACE TEMP VIEW rc_total_exposure_temp AS
+SELECT
+    'TOTAL PERFORMANCE' AS new_task_name,
+    COUNT(DISTINCT t.application_number) AS fraud_count,
+    SUM(t.saved_value) AS averted_exposure
+FROM (
+    SELECT DISTINCT
+        a.application_number,
+        d.saved_value
+    FROM rc_cc_apps a
+    LEFT JOIN rc_tdct_rulehits_base b
+        ON a.application_number = b.app_no2
+    LEFT JOIN rc_actions c
+        ON a.application_number = c.modified_app_no
+    LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
+        ON regexp_replace(regexp_replace(c.application_number, 'R', ''), 'P', '')
+         = regexp_replace(regexp_replace(d.application_number, 'R', ''), 'P', '')
+       AND c.date_updated = d.date_updated
+    LEFT JOIN rc_cc_rules e
+        ON b.rule_name = e.rule_name
+    CROSS JOIN params p
+    WHERE a.product_type IN ('PUCC', 'PSCC')
+      AND e.rule_name IS NOT NULL
+      AND b.create_date_time >= p.start_date
+      AND b.create_date_time < p.end_date
+      AND d.action_status_code IN ('H', 'S')
+) t
+;
+
+
+-- FINAL QUEUE PERFORMANCE
+SELECT
+    r.queue_priority,
+    a.new_task_name AS queue_name,
+
+    COALESCE(a.queue_alert, 0) AS queue_alert,
+    CAST(COALESCE(a.queue_alert, 0) / 20.0 AS DECIMAL(18,1)) AS alerts_per_day,
+
+    COALESCE(a.queue_worked, 0) AS queue_worked,
+    COALESCE(a.queue_confirmed_fraud, 0) AS queue_confirmed_fraud,
+    COALESCE(a.queue_fully_investigated, 0) AS queue_fully_investigated,
+    COALESCE(a.queue_possible_fraud, 0) AS queue_possible_fraud,
+    COALESCE(a.queue_clear_after_investigation, 0) AS queue_clear_after_investigation,
+    COALESCE(a.queue_clear_noinvestigation, 0) AS queue_clear_noinvestigation,
+    COALESCE(a.queue_under_investigation, 0) AS queue_under_investigation,
+
+    COALESCE(a.unique_alerted_application, 0) AS unique_alerted_application,
+    COALESCE(a.customer_confirmed_fraud, 0) AS customer_confirmed_fraud,
+    COALESCE(a.customer_worked, 0) AS customer_worked,
+    COALESCE(a.customer_fully_investigated, 0) AS customer_fully_investigated,
+    COALESCE(a.customer_possible_fraud, 0) AS customer_possible_fraud,
+    COALESCE(a.customer_clear_after_investigation, 0) AS customer_clear_after_investigation,
+    COALESCE(a.customer_clear_noinvestigation, 0) AS customer_clear_noinvestigation,
+    COALESCE(a.customer_clear_under_investigation, 0) AS customer_clear_under_investigation,
+
+    COALESCE(b.averted_exposure, 0) AS averted_exposure,
+
+    CASE
+        WHEN COALESCE(a.queue_confirmed_fraud, 0) = 0 THEN 'NA'
+        ELSE CONCAT(CAST((CAST(a.queue_alert AS DECIMAL(18,2)) / CAST(a.queue_confirmed_fraud AS DECIMAL(18,2))) - 1 AS STRING), ':1')
+    END AS queue_fpr,
+
+    CASE
+        WHEN COALESCE(a.queue_confirmed_fraud, 0) = 0 THEN 'NA'
+        ELSE CONCAT(CAST((CAST(a.queue_worked AS DECIMAL(18,2)) / CAST(a.queue_confirmed_fraud AS DECIMAL(18,2))) - 1 AS STRING), ':1')
+    END AS worked_fpr,
+
+    CASE
+        WHEN COALESCE(a.customer_confirmed_fraud, 0) = 0 THEN 'NA'
+        ELSE CONCAT(CAST((CAST(a.customer_fully_investigated AS DECIMAL(18,2)) / CAST(a.customer_confirmed_fraud AS DECIMAL(18,2))) - 1 AS STRING), ':1')
+    END AS customer_fpr
+
+FROM rc_queue_performance_temp a
+LEFT JOIN rc_queue_exposure_temp b
+    ON a.new_task_name = b.new_task_name
+LEFT JOIN (
+    SELECT queue_name, MIN(queue_priority) AS queue_priority
+    FROM rc_cc_rules
+  
