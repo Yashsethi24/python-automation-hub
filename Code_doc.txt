@@ -1,84 +1,10 @@
-import pandas as pd
-import os
-from datetime import datetime
-
-# Input file with applications and scores
-input_file = r"C:\Your\Folder\TU_IDX_Apps_w_Scores.xlsx"
-
-# Output threshold tracking file
-threshold_file = r"C:\Your\Folder\threshold.csv"
-
-score_col = "IDXSC100"
-app_col = "Application_Number"
-
-target_apps = 40
-
-# Read file
-df = pd.read_excel(input_file, dtype={app_col: str})
-
-# Clean score
-df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
-df = df.dropna(subset=[score_col])
-
-# Unique sorted scores, descending
-scores = sorted(df[score_col].unique(), reverse=True)
-
-threshold_results = []
-
-for score in scores:
-    num_apps = df.loc[df[score_col] >= score, app_col].nunique()
-
-    threshold_results.append({
-        "threshold": score,
-        "num_apps": num_apps,
-        "diff_from_target": abs(num_apps - target_apps)
-    })
-
-threshold_df = pd.DataFrame(threshold_results)
-
-# Select threshold closest to 40 applications
-best_row = threshold_df.sort_values(
-    by=["diff_from_target", "threshold"],
-    ascending=[True, False]
-).iloc[0]
-
-selected_threshold = best_row["threshold"]
-selected_num_apps = best_row["num_apps"]
-
-# Optional: check one score higher and one score lower
-higher_threshold = selected_threshold + 1
-lower_threshold = selected_threshold - 1
-
-num_apps_higher = df.loc[df[score_col] >= higher_threshold, app_col].nunique()
-num_apps_lower = df.loc[df[score_col] >= lower_threshold, app_col].nunique()
-
-# Record to save
-record = pd.DataFrame([{
-    "run_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "file_name": os.path.basename(input_file),
-    "selected_threshold": selected_threshold,
-    "num_apps_at_threshold": selected_num_apps,
-    "num_apps_at_threshold_plus_1": num_apps_higher,
-    "num_apps_at_threshold_minus_1": num_apps_lower
-}])
-
-# Append to threshold.csv
-if os.path.exists(threshold_file):
-    record.to_csv(threshold_file, mode="a", header=False, index=False)
-else:
-    record.to_csv(threshold_file, index=False)
-
-print(f"Selected threshold: {selected_threshold}")
-print(f"Applications at threshold: {selected_num_apps}")
-print(f"Applications at threshold + 1: {num_apps_higher}")
-print(f"Applications at threshold - 1: {num_apps_lower}")
-
-threshold_history = pd.read_csv(threshold_file)
-
-threshold_history["run_datetime"] = pd.to_datetime(threshold_history["run_datetime"])
-
-last_7_days_avg = threshold_history[
-    threshold_history["run_datetime"] >= pd.Timestamp.today() - pd.Timedelta(days=7)
-]["selected_threshold"].mean()
-
-print(last_7_days_avg)
+threshold_note = """
+<br><br>
+<b>Score Threshold Notes:</b><br>
+<ul>
+    <li><b>TDCT:</b> Starting <b>July 2</b>, the score threshold for <b>blocking</b> is <b>250</b>. 
+    For <b>alerting</b>, the threshold is dynamic and selects a score that generates approximately 
+    <b>40 applications</b> for Ops review.</li>
+    <li><b>MBNA:</b> Score threshold is <b>270</b>.</li>
+</ul>
+"""
