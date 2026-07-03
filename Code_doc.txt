@@ -1,14 +1,36 @@
-threshold_note = """
-<br><br>
-<b>Score Threshold Notes:</b><br>
-<ul>
-    <li><b>TDCT:</b>
-        <ul>
-            <li>Until <b>June 18</b>, the score threshold was <b>243</b>.</li>
-            <li>From <b>June 20 to July 1</b>, a tiered review strategy was used, where applications with scores between <b>150 and 300</b> were sent for Ops review.</li>
-            <li>Starting <b>July 2</b>, the <b>blocking</b> score threshold is <b>250</b>. For <b>alerting</b>, the threshold is dynamic and is selected daily to generate approximately <b>40 applications</b> for Ops review.</li>
-        </ul>
-    </li>
-    <li><b>MBNA:</b> The score threshold for alerting is <b>270</b>.</li>
-</ul>
-"""
+import pandas as pd
+import glob
+import os
+
+folder_path = r"C:\Your\Folder"
+
+# -----------------------------
+# Read all EOD_income files
+# -----------------------------
+income_files = sorted(
+    glob.glob(os.path.join(folder_path, "*EOD_income*.xlsx"))
+)
+
+income_df = pd.concat(
+    [pd.read_excel(f, dtype=str) for f in income_files],
+    ignore_index=True
+)
+
+print(f"Income files read: {len(income_files)}")
+print(f"Income rows: {len(income_df)}")
+
+
+# -----------------------------
+# Read all EOD_address_match files
+# -----------------------------
+address_files = sorted(
+    glob.glob(os.path.join(folder_path, "*EOD_address_match*.xlsx"))
+)
+
+address_df = pd.concat(
+    [pd.read_excel(f, dtype=str) for f in address_files],
+    ignore_index=True
+)
+
+print(f"Address files read: {len(address_files)}")
+print(f"Address rows: {len(address_df)}")
