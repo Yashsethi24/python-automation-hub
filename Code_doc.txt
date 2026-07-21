@@ -1,376 +1,588 @@
-import pandas as pd
+-- Databricks notebook source
+-- MAGIC %sql
 
-mapping_path = "/Workspace/Users/yash.sethi@td.com/IFAD to DSAP Script Migration/TDAF_queue_rules.csv"
+-- ============================================================
+-- 1. DATE PARAMETERS
+-- ============================================================
 
-pdf = pd.read_csv(mapping_path)
+CREATE OR REPLACE TEMP VIEW loan_parameters AS
+SELECT
+    DATE('2026-04-01') AS start_date,
+    DATE('2026-07-17') AS end_date,
 
-pdf = (
-    pdf[["Queue", "rule_name"]]
-    .dropna(subset=["Queue", "rule_name"])
-    .drop_duplicates()
+    -- Previous full month relative to end_date
+    ADD_MONTHS(DATE_TRUNC('MONTH', DATE('2026-07-17')), -1) AS previous_month_start,
+    DATE_SUB(DATE_TRUNC('MONTH', DATE('2026-07-17')), 1) AS previous_month_end,
+
+    -- Current month-to-date
+    DATE_TRUNC('MONTH', DATE('2026-07-17')) AS current_mtd_start,
+
+    -- Last seven days, including end_date
+    DATE_SUB(DATE('2026-07-17'), 6) AS week_start,
+    DATE('2026-07-17') AS week_end;
+
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 2. APPLICATION DATA
+-- ============================================================
+-- Equivalent to ##LOAN_APPS_YS
+--
+-- One row is retained per application_number to prevent
+-- duplicate rows during downstream joins.
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW loan_apps AS
+WITH filtered_applications AS (
+    SELECT
+        a.*,
+
+        CASE
+            WHEN DATEDIFF(
+                TO_DATE(a.application_date),
+                TO_DATE(a.date_account_opened)
+            ) <= 90
+            THEN 'N2B'
+            ELSE 'E2B'
+        END AS customer_tenure_90d,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY a.application_number
+            ORDER BY a.application_date DESC
+        ) AS row_num
+
+    FROM hive_metastore.fiqm.applications a
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        (
+            UPPER(TRIM(a.product_type)) IN ('PUL', 'PSL')
+            OR (
+                UPPER(TRIM(a.product_type)) = 'AL'
+                AND LENGTH(TRIM(CAST(a.application_number AS STRING))) = 11
+            )
+        )
+
+        AND a.application_date >= p.start_date
+        AND a.application_date < DATE_ADD(p.end_date, 1)
 )
 
-df_rules = spark.createDataFrame(pdf)
-df_rules.createOrReplaceTempView("rc_tdaf_rules_raw")
-
-CREATE OR REPLACE TEMP VIEW params AS
 SELECT
-    add_months(date_trunc('MONTH', current_date()), -1) AS start_date,
-    date_trunc('MONTH', current_date()) AS end_date
-;
+    * EXCEPT (row_num)
+FROM filtered_applications
+WHERE row_num = 1;
 
-CREATE OR REPLACE TEMP VIEW rc_tdaf_rules AS
+
+-- COMMAND ----------
+
+-- Optional validation
 SELECT
-    lpad(CAST(dense_rank() OVER (ORDER BY Queue) AS STRING), 2, '0') AS queue_priority,
-    Queue AS queue_name,
-    rule_name
-FROM rc_tdaf_rules_raw
-WHERE Queue IS NOT NULL
-  AND rule_name IS NOT NULL
-;
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT application_number) AS distinct_applications,
+    MIN(application_date) AS minimum_application_date,
+    MAX(application_date) AS maximum_application_date
+FROM loan_apps;
 
-CREATE OR REPLACE TEMP VIEW rc_actions_before AS
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 3. FRAUD ACTION DATA
+-- ============================================================
+-- Equivalent to the filtered tdct action CTE.
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW loan_action_base AS
 SELECT
-    c.application_number,
-    MAX(c.date_updated) AS date_updated
-FROM hive_metastore.fiqm.tdct_rt_action c
-CROSS JOIN params p
-WHERE c.date_updated < p.start_date
-GROUP BY c.application_number
-;
+    act.*
+FROM hive_metastore.fiqm.tdct_rt_action act
+CROSS JOIN loan_parameters p
 
-CREATE OR REPLACE TEMP VIEW rc_actions AS
+WHERE
+    (
+        UPPER(TRIM(act.product_code)) IN ('PUL', 'PSL')
+        OR (
+            UPPER(TRIM(act.product_code)) = 'AL'
+            AND LENGTH(TRIM(CAST(act.application_number AS STRING))) = 11
+        )
+    )
+
+    AND act.date_updated >= p.start_date
+    AND act.date_updated < DATE_ADD(p.end_date, 1)
+
+    AND UPPER(TRIM(act.action_status_code)) IN ('H', 'S');
+
+
+
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 4. FRAUD DATA ENRICHED WITH APPLICATION ATTRIBUTES
+-- ============================================================
+-- Equivalent to ##LOAN_FRAUDS_YS.
+--
+-- The application join brings in:
+--   - decision_path
+--   - customer_tenure_90d
+--
+-- SAMD applications are excluded.
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW loan_frauds AS
 SELECT
-    c.application_number,
-    MAX(c.date_updated) AS date_updated
-FROM hive_metastore.fiqm.tdct_rt_action c
-CROSS JOIN params p
-WHERE c.date_updated >= p.start_date
-  AND NOT EXISTS (
-      SELECT 1
-      FROM rc_actions_before d
-      WHERE d.application_number = c.application_number
-  )
-GROUP BY c.application_number
-;
+    act.*,
+    apps.decision_path,
+    apps.customer_tenure_90d,
+    apps.application_date,
+    apps.date_account_opened
 
-CREATE OR REPLACE TEMP VIEW rc_tdaf_apps AS
+FROM loan_action_base act
+
+LEFT JOIN loan_apps apps
+    ON CAST(act.application_number AS STRING)
+     = CAST(apps.application_number AS STRING)
+
+WHERE
+    COALESCE(UPPER(TRIM(apps.decision_path)), '') <> 'SAMD';
+
+
+
+-- COMMAND ----------
+
+-- Optional validation
 SELECT
-    trim(application_number) AS new_application_number,
-    *
-FROM hive_metastore.fiqm.applications
-WHERE product_type = 'AL'
-  AND data_source = 'Indirect'
-;
+    COUNT(*) AS action_rows,
+    COUNT(DISTINCT application_number) AS distinct_fraud_applications,
+    MIN(date_updated) AS minimum_action_date,
+    MAX(date_updated) AS maximum_action_date
+FROM loan_frauds;
 
-CREATE OR REPLACE TEMP VIEW rc_temp_tdaf_rulehits AS
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 5. PI DECK STATISTICS
+-- ============================================================
+
+WITH fraud_match_summary AS (
+    SELECT
+        f.application_number,
+        DATE_FORMAT(f.date_updated, 'yyyy-MM') AS year_month,
+        MAX(COALESCE(f.saved_value, 0)) AS saved_value,
+        MAX(
+            CASE
+                WHEN m.application_number IS NOT NULL THEN 1
+                ELSE 0
+            END
+        ) AS matched_alert_flag
+
+    FROM loan_frauds f
+
+    LEFT JOIN hive_metastore.fiqm.tdct_rt_match m
+        ON CAST(f.application_number AS STRING)
+         = CAST(m.application_number AS STRING)
+
+    GROUP BY
+        f.application_number,
+        DATE_FORMAT(f.date_updated, 'yyyy-MM')
+)
+
 SELECT
-    a.*,
-    CAST(a.create_date_time AS DATE) AS alert_date
-FROM hive_metastore.fiqm.tdct_rt_match a
-INNER JOIN rc_tdaf_apps b
-    ON a.application_number = b.new_application_number
-CROSS JOIN params p
-WHERE a.rule_name NOT LIKE 'W_%'
-  AND a.create_date_time >= p.start_date
-  AND a.create_date_time < p.end_date
-;
+    year_month,
+    COUNT(DISTINCT application_number) AS fraud,
+    COUNT(
+        DISTINCT CASE
+            WHEN matched_alert_flag = 1
+            THEN application_number
+        END
+    ) AS alerted_fraud,
+    SUM(saved_value) AS averted_exposure
 
-CREATE OR REPLACE TEMP VIEW rc_temp_tdaf_rulehits_2 AS
+FROM fraud_match_summary
+
+GROUP BY year_month
+ORDER BY year_month;
+
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 6. MONTHLY APPLICATION AND FRAUD STATISTICS
+-- ============================================================
+
+WITH monthly_apps AS (
+    SELECT
+        DATE_FORMAT(application_date, 'yyyy-MM') AS year_month,
+        COUNT(DISTINCT application_number) AS num_apps
+    FROM loan_apps
+    GROUP BY DATE_FORMAT(application_date, 'yyyy-MM')
+),
+
+monthly_frauds AS (
+    SELECT
+        DATE_FORMAT(date_updated, 'yyyy-MM') AS year_month,
+        COUNT(DISTINCT application_number) AS num_frauds
+    FROM loan_frauds
+    GROUP BY DATE_FORMAT(date_updated, 'yyyy-MM')
+)
+
 SELECT
-    a.*,
-    b.queue_priority,
-    b.queue_name
-FROM rc_temp_tdaf_rulehits a
-LEFT JOIN rc_tdaf_rules b
-    ON a.rule_name = b.rule_name
-WHERE b.rule_name IS NOT NULL
-;
+    a.year_month,
+    a.num_apps,
+    COALESCE(f.num_frauds, 0) AS num_frauds,
+    ROUND(
+        100.0 * COALESCE(f.num_frauds, 0) / NULLIF(a.num_apps, 0),
+        2
+    ) AS fraud_rate_pct
 
-CREATE OR REPLACE TEMP VIEW rc_temp_tdaf_rulehits_3 AS
+FROM monthly_apps a
+
+LEFT JOIN monthly_frauds f
+    ON a.year_month = f.year_month
+
+ORDER BY a.year_month;
+
+
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 7. PREVIOUS FULL MONTH STATISTICS
+-- ============================================================
+
+WITH previous_month_apps AS (
+    SELECT
+        DATE_FORMAT(a.application_date, 'yyyy-MM') AS year_month,
+        COUNT(DISTINCT a.application_number) AS num_apps
+
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        a.application_date >= p.previous_month_start
+        AND a.application_date < DATE_ADD(p.previous_month_end, 1)
+
+    GROUP BY DATE_FORMAT(a.application_date, 'yyyy-MM')
+),
+
+previous_month_frauds AS (
+    SELECT
+        DATE_FORMAT(f.date_updated, 'yyyy-MM') AS year_month,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        f.date_updated >= p.previous_month_start
+        AND f.date_updated < DATE_ADD(p.previous_month_end, 1)
+
+    GROUP BY DATE_FORMAT(f.date_updated, 'yyyy-MM')
+)
+
 SELECT
-    application_number,
-    CAST(create_date_time AS DATE) AS create_date_time,
-    MIN(queue_priority) AS final_queue_priority
-FROM rc_temp_tdaf_rulehits_2
-GROUP BY application_number, CAST(create_date_time AS DATE)
-;
+    a.year_month,
+    a.num_apps,
+    COALESCE(f.num_frauds, 0) AS num_frauds,
+    ROUND(
+        100.0 * COALESCE(f.num_frauds, 0) / NULLIF(a.num_apps, 0),
+        2
+    ) AS fraud_rate_pct
 
-CREATE OR REPLACE TEMP VIEW rc_temp_tdaf_rulehits_4 AS
-SELECT DISTINCT
-    a.application_number,
-    a.create_date_time,
-    a.final_queue_priority,
-    b.queue_name AS temp_task_name
-FROM rc_temp_tdaf_rulehits_3 a
-LEFT JOIN rc_tdaf_rules b
-    ON a.final_queue_priority = b.queue_priority
-;
+FROM previous_month_apps a
 
-CREATE OR REPLACE TEMP VIEW rc_tdaf_rulehits_base AS
+LEFT JOIN previous_month_frauds f
+    ON a.year_month = f.year_month
+
+ORDER BY a.year_month;
+
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 8. LAST SEVEN DAYS
+-- ============================================================
+
+WITH weekly_apps AS (
+    SELECT
+        COUNT(DISTINCT a.application_number) AS num_apps
+
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        a.application_date >= p.week_start
+        AND a.application_date < DATE_ADD(p.week_end, 1)
+),
+
+weekly_frauds AS (
+    SELECT
+        COUNT(DISTINCT f.application_number) AS num_frauds
+
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        f.date_updated >= p.week_start
+        AND f.date_updated < DATE_ADD(p.week_end, 1)
+)
+
 SELECT
-    a.*,
-    b.temp_task_name,
-    CASE
-        WHEN a.task_name IS NOT NULL AND a.task_name <> '' THEN a.task_name
-        ELSE b.temp_task_name
-    END AS new_task_name
-FROM rc_temp_tdaf_rulehits a
-LEFT JOIN rc_temp_tdaf_rulehits_4 b
-    ON a.application_number = b.application_number
-   AND CAST(a.create_date_time AS DATE) = b.create_date_time
-WHERE b.temp_task_name IS NOT NULL
-;
+    p.week_start,
+    p.week_end,
+    a.num_apps,
+    f.num_frauds,
+    ROUND(
+        100.0 * f.num_frauds / NULLIF(a.num_apps, 0),
+        2
+    ) AS fraud_rate_pct
 
-CREATE OR REPLACE TEMP VIEW rc_queue_performance_temp AS
+FROM weekly_apps a
+CROSS JOIN weekly_frauds f
+CROSS JOIN loan_parameters p;
+
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 9. MONTHLY STATS BY CUSTOMER TENURE
+-- ============================================================
+
+WITH tenure_apps AS (
+    SELECT
+        DATE_FORMAT(a.application_date, 'yyyy-MM') AS year_month,
+        a.customer_tenure_90d,
+        COUNT(DISTINCT a.application_number) AS num_apps
+
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        (
+            a.application_date >= p.previous_month_start
+            AND a.application_date < DATE_ADD(p.previous_month_end, 1)
+        )
+        OR
+        (
+            a.application_date >= p.current_mtd_start
+            AND a.application_date < DATE_ADD(p.end_date, 1)
+        )
+
+    GROUP BY
+        DATE_FORMAT(a.application_date, 'yyyy-MM'),
+        a.customer_tenure_90d
+),
+
+tenure_frauds AS (
+    SELECT
+        DATE_FORMAT(f.date_updated, 'yyyy-MM') AS year_month,
+        f.customer_tenure_90d,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        (
+            f.date_updated >= p.previous_month_start
+            AND f.date_updated < DATE_ADD(p.previous_month_end, 1)
+        )
+        OR
+        (
+            f.date_updated >= p.current_mtd_start
+            AND f.date_updated < DATE_ADD(p.end_date, 1)
+        )
+
+    GROUP BY
+        DATE_FORMAT(f.date_updated, 'yyyy-MM'),
+        f.customer_tenure_90d
+)
+
 SELECT
-    b.new_task_name,
+    a.year_month,
+    a.customer_tenure_90d,
+    a.num_apps,
+    COALESCE(f.num_frauds, 0) AS num_frauds,
+    ROUND(
+        100.0 * COALESCE(f.num_frauds, 0) / NULLIF(a.num_apps, 0),
+        2
+    ) AS fraud_rate_pct
 
-    COUNT(DISTINCT CONCAT(CAST(a.new_application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))) AS queue_alert,
+FROM tenure_apps a
 
-    COUNT(DISTINCT CASE
-        WHEN d.action_status_code IN ('CA','CN','H','S','P')
-        THEN CONCAT(CAST(a.new_application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd'))
-    END) AS queue_worked,
+LEFT JOIN tenure_frauds f
+    ON a.year_month = f.year_month
+   AND a.customer_tenure_90d = f.customer_tenure_90d
 
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CN')
-        THEN CONCAT(CAST(a.new_application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd')) END) AS queue_clear_noinvestigation,
+ORDER BY
+    a.year_month,
+    a.customer_tenure_90d DESC;
 
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('P')
-        THEN CONCAT(CAST(a.new_application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd')) END) AS queue_possible_fraud,
 
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CA')
-        THEN CONCAT(CAST(a.new_application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd')) END) AS queue_clear_after_investigation,
 
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('I')
-        THEN CONCAT(CAST(a.new_application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd')) END) AS queue_under_investigation,
+-- COMMAND ----------
 
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('P','CA','H','S')
-        THEN CONCAT(CAST(a.new_application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd')) END) AS queue_fully_investigated,
+-- ============================================================
+-- 10. LAST SEVEN DAYS BY CUSTOMER TENURE
+-- ============================================================
 
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('H','S')
-        THEN CONCAT(CAST(a.new_application_number AS STRING), '_', date_format(b.create_date_time, 'yyyy-MM-dd')) END) AS queue_confirmed_fraud,
+WITH weekly_tenure_apps AS (
+    SELECT
+        a.customer_tenure_90d,
+        COUNT(DISTINCT a.application_number) AS num_apps
 
-    COUNT(DISTINCT a.new_application_number) AS unique_alerted_application,
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
 
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CA','CN','H','S','P') THEN a.new_application_number END) AS customer_worked,
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CN') THEN a.new_application_number END) AS customer_clear_noinvestigation,
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('P') THEN a.new_application_number END) AS customer_possible_fraud,
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('CA') THEN a.new_application_number END) AS customer_clear_after_investigation,
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('I') THEN a.new_application_number END) AS customer_clear_under_investigation,
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('P','CA','H','S') THEN a.new_application_number END) AS customer_fully_investigated,
-    COUNT(DISTINCT CASE WHEN d.action_status_code IN ('H','S') THEN a.new_application_number END) AS customer_confirmed_fraud
+    WHERE
+        a.application_date >= p.week_start
+        AND a.application_date < DATE_ADD(p.week_end, 1)
 
-FROM rc_tdaf_apps a
-LEFT JOIN rc_tdaf_rulehits_base b
-    ON a.new_application_number = b.application_number
-LEFT JOIN rc_actions c
-    ON a.new_application_number = c.application_number
-LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
-    ON c.application_number = d.application_number
-   AND c.date_updated = d.date_updated
-LEFT JOIN rc_tdaf_rules e
-    ON b.rule_name = e.rule_name
-CROSS JOIN params p
-WHERE a.product_type = 'AL'
-  AND a.data_source = 'Indirect'
-  AND e.rule_name IS NOT NULL
-  AND b.create_date_time >= p.start_date
-  AND b.create_date_time < p.end_date
-GROUP BY b.new_task_name
-;
+    GROUP BY a.customer_tenure_90d
+),
 
-CREATE OR REPLACE TEMP VIEW rc_queue_exposure_temp AS
+weekly_tenure_frauds AS (
+    SELECT
+        f.customer_tenure_90d,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        f.date_updated >= p.week_start
+        AND f.date_updated < DATE_ADD(p.week_end, 1)
+
+    GROUP BY f.customer_tenure_90d
+)
+
 SELECT
-    t.new_task_name,
-    COUNT(DISTINCT t.new_application_number) AS fraud_count,
-    SUM(t.saved_value) AS averted_exposure
-FROM (
-    SELECT DISTINCT
-        b.new_task_name,
-        a.new_application_number,
-        d.saved_value
-    FROM rc_tdaf_apps a
-    LEFT JOIN rc_tdaf_rulehits_base b
-        ON a.new_application_number = b.application_number
-    LEFT JOIN rc_actions c
-        ON a.new_application_number = c.application_number
-    LEFT JOIN hive_metastore.fiqm.tdct_rt_action d
-        ON c.application_number = d.application_number
-       AND c.date_updated = d.date_updated
-    LEFT JOIN rc_tdaf_rules e
-        ON b.rule_name = e.rule_name
-    CROSS JOIN params p
-    WHERE a.product_type = 'AL'
-      AND a.data_source = 'Indirect'
-      AND e.rule_name IS NOT NULL
-      AND b.create_date_time >= p.start_date
-      AND b.create_date_time < p.end_date
-      AND d.action_status_code IN ('H','S')
-) t
-GROUP BY t.new_task_name
-;
+    p.week_start,
+    p.week_end,
+    a.customer_tenure_90d,
+    a.num_apps,
+    COALESCE(f.num_frauds, 0) AS num_frauds,
+    ROUND(
+        100.0 * COALESCE(f.num_frauds, 0) / NULLIF(a.num_apps, 0),
+        2
+    ) AS fraud_rate_pct
 
-CREATE OR REPLACE TEMP VIEW rc_tier_performance_temp AS
+FROM weekly_tenure_apps a
+
+LEFT JOIN weekly_tenure_frauds f
+    ON a.customer_tenure_90d = f.customer_tenure_90d
+
+CROSS JOIN loan_parameters p
+
+ORDER BY a.customer_tenure_90d DESC;
+
+
+-- COMMAND ----------
+
+-- ============================================================
+-- 11. COMBINED KPI TABLE
+-- ============================================================
+
+WITH app_periods AS (
+    SELECT
+        'MONTHLY' AS reporting_period,
+        DATE_FORMAT(application_date, 'yyyy-MM') AS period_label,
+        COUNT(DISTINCT application_number) AS num_apps
+    FROM loan_apps
+    GROUP BY DATE_FORMAT(application_date, 'yyyy-MM')
+
+    UNION ALL
+
+    SELECT
+        'PREVIOUS_MONTH' AS reporting_period,
+        DATE_FORMAT(a.application_date, 'yyyy-MM') AS period_label,
+        COUNT(DISTINCT a.application_number) AS num_apps
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
+    WHERE
+        a.application_date >= p.previous_month_start
+        AND a.application_date < DATE_ADD(p.previous_month_end, 1)
+    GROUP BY DATE_FORMAT(a.application_date, 'yyyy-MM')
+
+    UNION ALL
+
+    SELECT
+        'WEEKLY' AS reporting_period,
+        CONCAT(
+            DATE_FORMAT(p.week_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.week_end, 'yyyy-MM-dd')
+        ) AS period_label,
+        COUNT(DISTINCT a.application_number) AS num_apps
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
+    WHERE
+        a.application_date >= p.week_start
+        AND a.application_date < DATE_ADD(p.week_end, 1)
+    GROUP BY p.week_start, p.week_end
+),
+
+fraud_periods AS (
+    SELECT
+        'MONTHLY' AS reporting_period,
+        DATE_FORMAT(date_updated, 'yyyy-MM') AS period_label,
+        COUNT(DISTINCT application_number) AS num_frauds
+    FROM loan_frauds
+    GROUP BY DATE_FORMAT(date_updated, 'yyyy-MM')
+
+    UNION ALL
+
+    SELECT
+        'PREVIOUS_MONTH' AS reporting_period,
+        DATE_FORMAT(f.date_updated, 'yyyy-MM') AS period_label,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+    WHERE
+        f.date_updated >= p.previous_month_start
+        AND f.date_updated < DATE_ADD(p.previous_month_end, 1)
+    GROUP BY DATE_FORMAT(f.date_updated, 'yyyy-MM')
+
+    UNION ALL
+
+    SELECT
+        'WEEKLY' AS reporting_period,
+        CONCAT(
+            DATE_FORMAT(p.week_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.week_end, 'yyyy-MM-dd')
+        ) AS period_label,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+    WHERE
+        f.date_updated >= p.week_start
+        AND f.date_updated < DATE_ADD(p.week_end, 1)
+    GROUP BY p.week_start, p.week_end
+)
+
 SELECT
-    CASE
-        WHEN b.new_task_name LIKE '%T1%' THEN 'TIER 1'
-        WHEN b.new_task_name LIKE '%T2%' THEN 'TIER 2'
-        WHEN b.new_task_name LIKE '%T3%' THEN 'TIER 3'
-        ELSE 'NOT IN ANY TIER'
-    END AS tier,
-    SUM(queue_alert) AS queue_alert,
-    SUM(queue_worked) AS queue_worked,
-    SUM(queue_clear_noinvestigation) AS queue_clear_noinvestigation,
-    SUM(queue_possible_fraud) AS queue_possible_fraud,
-    SUM(queue_clear_after_investigation) AS queue_clear_after_investigation,
-    SUM(queue_under_investigation) AS queue_under_investigation,
-    SUM(queue_fully_investigated) AS queue_fully_investigated,
-    SUM(queue_confirmed_fraud) AS queue_confirmed_fraud,
-    SUM(unique_alerted_application) AS unique_alerted_application,
-    SUM(customer_worked) AS customer_worked,
-    SUM(customer_clear_noinvestigation) AS customer_clear_noinvestigation,
-    SUM(customer_possible_fraud) AS customer_possible_fraud,
-    SUM(customer_clear_after_investigation) AS customer_clear_after_investigation,
-    SUM(customer_clear_under_investigation) AS customer_clear_under_investigation,
-    SUM(customer_fully_investigated) AS customer_fully_investigated,
-    SUM(customer_confirmed_fraud) AS customer_confirmed_fraud
-FROM rc_queue_performance_temp b
-GROUP BY
-    CASE
-        WHEN b.new_task_name LIKE '%T1%' THEN 'TIER 1'
-        WHEN b.new_task_name LIKE '%T2%' THEN 'TIER 2'
-        WHEN b.new_task_name LIKE '%T3%' THEN 'TIER 3'
-        ELSE 'NOT IN ANY TIER'
-    END
-;
+    a.reporting_period,
+    a.period_label,
+    a.num_apps,
+    COALESCE(f.num_frauds, 0) AS num_frauds,
+    ROUND(
+        100.0 * COALESCE(f.num_frauds, 0) / NULLIF(a.num_apps, 0),
+        2
+    ) AS fraud_rate_pct
 
-CREATE OR REPLACE TEMP VIEW rc_tier_exposure_temp AS
-SELECT
-    CASE
-        WHEN new_task_name LIKE '%T1%' THEN 'TIER 1'
-        WHEN new_task_name LIKE '%T2%' THEN 'TIER 2'
-        WHEN new_task_name LIKE '%T3%' THEN 'TIER 3'
-        ELSE 'NOT IN ANY TIER'
-    END AS tier,
-    SUM(fraud_count) AS fraud_count,
-    SUM(averted_exposure) AS averted_exposure
-FROM rc_queue_exposure_temp
-GROUP BY
-    CASE
-        WHEN new_task_name LIKE '%T1%' THEN 'TIER 1'
-        WHEN new_task_name LIKE '%T2%' THEN 'TIER 2'
-        WHEN new_task_name LIKE '%T3%' THEN 'TIER 3'
-        ELSE 'NOT IN ANY TIER'
-    END
-;
+FROM app_periods a
 
-CREATE OR REPLACE TEMP VIEW rc_total_performance_temp AS
-SELECT
-    'TOTAL PERFORMANCE' AS new_task_name,
-    SUM(queue_alert) AS queue_alert,
-    SUM(queue_worked) AS queue_worked,
-    SUM(queue_clear_noinvestigation) AS queue_clear_noinvestigation,
-    SUM(queue_possible_fraud) AS queue_possible_fraud,
-    SUM(queue_clear_after_investigation) AS queue_clear_after_investigation,
-    SUM(queue_under_investigation) AS queue_under_investigation,
-    SUM(queue_fully_investigated) AS queue_fully_investigated,
-    SUM(queue_confirmed_fraud) AS queue_confirmed_fraud,
-    SUM(unique_alerted_application) AS unique_alerted_application,
-    SUM(customer_worked) AS customer_worked,
-    SUM(customer_clear_noinvestigation) AS customer_clear_noinvestigation,
-    SUM(customer_possible_fraud) AS customer_possible_fraud,
-    SUM(customer_clear_after_investigation) AS customer_clear_after_investigation,
-    SUM(customer_clear_under_investigation) AS customer_clear_under_investigation,
-    SUM(customer_fully_investigated) AS customer_fully_investigated,
-    SUM(customer_confirmed_fraud) AS customer_confirmed_fraud
-FROM rc_queue_performance_temp
-;
+LEFT JOIN fraud_periods f
+    ON a.reporting_period = f.reporting_period
+   AND a.period_label = f.period_label
 
-CREATE OR REPLACE TEMP VIEW rc_total_exposure_temp AS
-SELECT
-    'TOTAL PERFORMANCE' AS new_task_name,
-    SUM(fraud_count) AS fraud_count,
-    SUM(averted_exposure) AS averted_exposure
-FROM rc_queue_exposure_temp
-;
-
-
--- FINAL QUEUE PERFORMANCE
-SELECT
-    r.queue_priority,
-    a.new_task_name AS queue_name,
-    COALESCE(a.queue_alert, 0) AS queue_alert,
-    CAST(COALESCE(a.queue_alert, 0) / 20.0 AS DECIMAL(18,1)) AS alerts_per_day,
-    COALESCE(a.queue_worked, 0) AS queue_worked,
-    COALESCE(a.queue_confirmed_fraud, 0) AS queue_confirmed_fraud,
-    COALESCE(a.queue_fully_investigated, 0) AS queue_fully_investigated,
-    COALESCE(a.queue_possible_fraud, 0) AS queue_possible_fraud,
-    COALESCE(a.queue_clear_after_investigation, 0) AS queue_clear_after_investigation,
-    COALESCE(a.queue_clear_noinvestigation, 0) AS queue_clear_noinvestigation,
-    COALESCE(a.queue_under_investigation, 0) AS queue_under_investigation,
-    COALESCE(a.unique_alerted_application, 0) AS unique_alerted_application,
-    COALESCE(a.customer_confirmed_fraud, 0) AS customer_confirmed_fraud,
-    COALESCE(a.customer_worked, 0) AS customer_worked,
-    COALESCE(a.customer_fully_investigated, 0) AS customer_fully_investigated,
-    COALESCE(b.averted_exposure, 0) AS averted_exposure,
-    CASE WHEN COALESCE(a.queue_confirmed_fraud, 0) = 0 THEN 'NA'
-         ELSE CONCAT(CAST((CAST(a.queue_alert AS DECIMAL(18,2)) / CAST(a.queue_confirmed_fraud AS DECIMAL(18,2))) - 1 AS STRING), ':1')
-    END AS queue_fpr,
-    CASE WHEN COALESCE(a.queue_confirmed_fraud, 0) = 0 THEN 'NA'
-         ELSE CONCAT(CAST((CAST(a.queue_worked AS DECIMAL(18,2)) / CAST(a.queue_confirmed_fraud AS DECIMAL(18,2))) - 1 AS STRING), ':1')
-    END AS worked_fpr,
-    CASE WHEN COALESCE(a.customer_confirmed_fraud, 0) = 0 THEN 'NA'
-         ELSE CONCAT(CAST((CAST(a.customer_fully_investigated AS DECIMAL(18,2)) / CAST(a.customer_confirmed_fraud AS DECIMAL(18,2))) - 1 AS STRING), ':1')
-    END AS customer_fpr
-FROM rc_queue_performance_temp a
-LEFT JOIN rc_queue_exposure_temp b
-    ON a.new_task_name = b.new_task_name
-LEFT JOIN (
-    SELECT queue_name, MIN(queue_priority) AS queue_priority
-    FROM rc_tdaf_rules
-    GROUP BY queue_name
-) r
-    ON a.new_task_name = r.queue_name
-ORDER BY r.queue_priority, a.new_task_name
-;
-
--- FINAL TIER PERFORMANCE
-SELECT
-    a.tier,
-    COALESCE(a.queue_alert, 0) AS queue_alert,
-    CAST(COALESCE(a.queue_alert, 0) / 20.0 AS DECIMAL(18,1)) AS alerts_per_day,
-    COALESCE(a.queue_worked, 0) AS queue_worked,
-    COALESCE(a.queue_confirmed_fraud, 0) AS queue_confirmed_fraud,
-    COALESCE(a.queue_fully_investigated, 0) AS queue_fully_investigated,
-    COALESCE(a.unique_alerted_application, 0) AS unique_alerted_application,
-    COALESCE(a.customer_confirmed_fraud, 0) AS customer_confirmed_fraud,
-    COALESCE(a.customer_worked, 0) AS customer_worked,
-    COALESCE(a.customer_fully_investigated, 0) AS customer_fully_investigated,
-    COALESCE(b.averted_exposure, 0) AS averted_exposure
-FROM rc_tier_performance_temp a
-LEFT JOIN rc_tier_exposure_temp b
-    ON a.tier = b.tier
-ORDER BY a.tier
-;
-
--- FINAL TOTAL PERFORMANCE
-SELECT
-    a.new_task_name,
-    COALESCE(a.queue_alert, 0) AS queue_alert,
-    CAST(COALESCE(a.queue_alert, 0) / 20.0 AS DECIMAL(18,1)) AS alerts_per_day,
-    COALESCE(a.queue_worked, 0) AS queue_worked,
-    COALESCE(a.queue_confirmed_fraud, 0) AS queue_confirmed_fraud,
-    COALESCE(a.queue_fully_investigated, 0) AS queue_fully_investigated,
-    COALESCE(a.unique_alerted_application, 0) AS unique_alerted_application,
-    COALESCE(a.customer_confirmed_fraud, 0) AS customer_confirmed_fraud,
-    COALESCE(a.customer_worked, 0) AS customer_worked,
-    COALESCE(a.customer_fully_investigated, 0) AS customer_fully_investigated,
-    COALESCE(b.averted_exposure, 0) AS averted_exposure
-FROM rc_total_performance_temp a
-LEFT JOIN rc_total_exposure_temp b
-    ON a.new_task_name = b.new_task_name
-;
-
-
-
+ORDER BY
+    CASE a.reporting_period
+        WHEN 'MONTHLY' THEN 1
+        WHEN 'PREVIOUS_MONTH' THEN 2
+        WHEN 'WEEKLY' THEN 3
+    END,
+    a.period_label;
