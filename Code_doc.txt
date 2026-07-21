@@ -6,21 +6,41 @@
 -- ============================================================
 
 CREATE OR REPLACE TEMP VIEW loan_parameters AS
+WITH base_dates AS (
+    SELECT
+        DATE('2026-04-01') AS start_date,
+        DATE('2026-07-17') AS end_date
+)
+
 SELECT
-    DATE('2026-04-01') AS start_date,
-    DATE('2026-07-17') AS end_date,
+    start_date,
+    end_date,
 
-    -- Previous full month relative to end_date
-    ADD_MONTHS(DATE_TRUNC('MONTH', DATE('2026-07-17')), -1) AS previous_month_start,
-    DATE_SUB(DATE_TRUNC('MONTH', DATE('2026-07-17')), 1) AS previous_month_end,
+    -- June 1, 2026
+    DATE_TRUNC(
+        'MONTH',
+        ADD_MONTHS(end_date, -1)
+    ) AS previous_month_start,
 
-    -- Current month-to-date
-    DATE_TRUNC('MONTH', DATE('2026-07-17')) AS current_mtd_start,
+    -- June 17, 2026
+    ADD_MONTHS(
+        end_date,
+        -1
+    ) AS previous_month_end,
 
-    -- Last seven days, including end_date
-    DATE_SUB(DATE('2026-07-17'), 6) AS week_start,
-    DATE('2026-07-17') AS week_end;
+    -- July 1, 2026
+    DATE_TRUNC(
+        'MONTH',
+        end_date
+    ) AS current_mtd_start,
 
+    -- July 11, 2026
+    DATE_SUB(end_date, 6) AS week_start,
+
+    -- July 17, 2026
+    end_date AS week_end
+
+FROM base_dates;
 
 -- COMMAND ----------
 
