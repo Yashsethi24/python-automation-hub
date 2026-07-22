@@ -1,13 +1,11 @@
-from pyspark.sql import functions as F
-
 start_date = dbutils.widgets.get("start_date")
 end_date = dbutils.widgets.get("end_date")
 
-print(f"Start Date: {start_date}")
-print(f"End Date: {end_date}")
+print(f"Start date: {start_date}")
+print(f"End date: {end_date}")
 
 spark.sql(f"""
-CREATE OR REPLACE TEMP VIEW pda_parameters AS
+CREATE OR REPLACE TEMP VIEW mbna_parameters AS
 
 WITH base_dates AS (
     SELECT
@@ -19,7 +17,6 @@ SELECT
     start_date,
     end_date,
 
-    -- Previous-month MTD start
     TO_DATE(
         DATE_TRUNC(
             'MONTH',
@@ -27,15 +24,12 @@ SELECT
         )
     ) AS previous_month_start,
 
-    -- Same day in previous month
     ADD_MONTHS(end_date, -1) AS previous_month_end,
 
-    -- Current month start
     TO_DATE(
         DATE_TRUNC('MONTH', end_date)
     ) AS current_mtd_start,
 
-    -- Last seven calendar days, including end_date
     DATE_SUB(end_date, 6) AS week_start,
 
     end_date AS week_end
@@ -43,213 +37,393 @@ SELECT
 FROM base_dates
 """)
 
-%sql
-
-CREATE OR REPLACE TEMP VIEW pda_fico_base AS
-
-SELECT
-    REGEXP_REPLACE(
-        CAST(fico.customerAcctNumber AS STRING),
-        '-',
-        ''
-    ) AS agreement_number,
-
-    CAST(fico.customerIdFromHeader AS STRING) AS party_number,
-
-    TO_DATE(fico.openDate) AS fico_open_date
-
-FROM cad_fico.ais fico
-CROSS JOIN pda_parameters p
-
-WHERE
-    fico.openDate >= p.start_date
-    AND fico.openDate < DATE_ADD(p.end_date, 1)
-    AND CAST(fico.currencyCode AS STRING) = '124';
-
 
 %sql
 
-CREATE OR REPLACE TEMP VIEW pda_agreement_base AS
+CREATE OR REPLACE TEMP VIEW mbna_application_base AS
 
-SELECT DISTINCT
-    CAST(b.agmt_cd AS STRING) AS agreement_number,
-    TO_DATE(b.agmt_open_dt) AS agreement_open_date
-
-FROM edf.agmt_can b
-CROSS JOIN pda_parameters p
-
-WHERE
-    b.appl_cd = 'PDA'
-    AND b.agmt_open_dt >= p.start_date
-    AND b.agmt_open_dt < DATE_ADD(p.end_date, 1);
-
-%sql
-
-CREATE OR REPLACE TEMP VIEW pda_applications AS
-
-WITH application_candidates AS (
+WITH filtered_applications AS (
     SELECT
-        -- Original final application-number construction
-        CONCAT(
-            'P',
-            CAST(pa.agmt_cd AS STRING),
-            '0',
-            LEFT(CAST(pa.prty_cd AS STRING), 5)
-        ) AS application_number,
+        CAST(a.application_number AS STRING) AS application_number,
+        CAST(a.account_number AS STRING) AS account_number,
 
-        COALESCE(
-            fico.fico_open_date,
-            agreement.agreement_open_date
-        ) AS application_date,
+        TO_DATE(a.load_date) AS load_date,
+        TO_DATE(a.application_date) AS application_date,
+        TO_DATE(a.date_account_opened) AS date_account_opened,
 
-        TO_DATE(customer.cust_sinc_dt) AS customer_since_date,
+        CAST(a.transit_number AS STRING) AS transit_number,
+        a.data_source,
 
-        customer.eff_start_dt AS record_effective_date,
+        CASE
+            WHEN a.date_account_opened IS NULL
+                OR a.application_date IS NULL
+            THEN 'UNKNOWN'
+
+            WHEN DATEDIFF(
+                TO_DATE(a.application_date),
+                TO_DATE(a.date_account_opened)
+            ) <= 90
+            THEN 'N2B'
+
+            ELSE 'E2B'
+        END AS customer_tenure_90d,
 
         ROW_NUMBER() OVER (
-            PARTITION BY
-                CONCAT(
-                    'P',
-                    CAST(pa.agmt_cd AS STRING),
-                    '0',
-                    LEFT(CAST(pa.prty_cd AS STRING), 5)
-                )
+            PARTITION BY CAST(a.application_number AS STRING)
             ORDER BY
-                customer.eff_start_dt DESC NULLS LAST
+                a.load_date DESC,
+                a.application_date DESC
         ) AS row_num
 
-    FROM edf.prty_agmt_can pa
-
-    INNER JOIN pda_agreement_base agreement
-        ON CAST(pa.agmt_cd AS STRING)
-         = agreement.agreement_number
-
-    LEFT JOIN pda_fico_base fico
-        ON CAST(pa.agmt_cd AS STRING)
-         = fico.agreement_number
-       AND CAST(pa.prty_cd AS STRING)
-         = fico.party_number
-
-    LEFT JOIN edf.prty_can customer
-        ON CAST(pa.prty_cd AS STRING)
-         = CAST(customer.prty_cd AS STRING)
-       AND customer.is_active_ind = 'Y'
+    FROM hive_metastore.fiqm.applications a
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        COALESCE(
-            fico.fico_open_date,
-            agreement.agreement_open_date
-        ) IS NOT NULL
-),
+        (
+            UPPER(TRIM(a.data_source)) = 'MBNA'
+            OR CAST(a.application_number AS STRING) RLIKE '^[A-F]'
+        )
 
-deduplicated_applications AS (
-    SELECT
-        application_number,
-        application_date,
-        customer_since_date
-
-    FROM application_candidates
-
-    WHERE row_num = 1
+        AND a.load_date >= p.start_date
+        AND a.load_date < DATE_ADD(p.end_date, 1)
 )
 
 SELECT
     application_number,
+    account_number,
+    load_date,
     application_date,
-    customer_since_date,
+    date_account_opened,
+    transit_number,
+    data_source,
+    customer_tenure_90d
 
-    CASE
-        WHEN customer_since_date IS NULL THEN 'UNKNOWN'
+FROM filtered_applications
 
-        WHEN DATEDIFF(
-            application_date,
-            customer_since_date
-        ) <= 90
-        THEN 'NTB'
-
-        ELSE 'ETB'
-    END AS customer_tenure_90d
-
-FROM deduplicated_applications;
-
-
+WHERE row_num = 1;
 
 %sql
+
+CREATE OR REPLACE TEMP VIEW mbna_tsys_base AS
 
 SELECT
-    COUNT(*) AS row_count,
-    COUNT(DISTINCT application_number) AS distinct_applications,
-    MIN(application_date) AS minimum_application_date,
-    MAX(application_date) AS maximum_application_date,
-    SUM(CASE WHEN customer_tenure_90d = 'NTB' THEN 1 ELSE 0 END) AS ntb_apps,
-    SUM(CASE WHEN customer_tenure_90d = 'ETB' THEN 1 ELSE 0 END) AS etb_apps,
-    SUM(CASE WHEN customer_tenure_90d = 'UNKNOWN' THEN 1 ELSE 0 END) AS unknown_tenure_apps
+    CAST(t.applid AS STRING) AS applid,
+    CAST(t.acct_num_ta1 AS STRING) AS card_number,
+    TO_DATE(t.open_dt) AS card_open_date,
 
-FROM pda_applications;
+    t.stc_secure_fraud,
+    TO_DATE(t.sec_fraud_stat_dt) AS secure_fraud_status_date
+
+FROM tsys.v_cfm_tsys_mbna_acct_slim t;
 
 
 %sql
 
-CREATE OR REPLACE TEMP VIEW pda_fraud_actions AS
+CREATE OR REPLACE TEMP VIEW mbna_application_cards AS
+
+WITH card_candidates AS (
+    SELECT
+        app.application_number,
+        app.account_number,
+        app.load_date,
+        app.application_date,
+        app.date_account_opened,
+        app.transit_number,
+        app.customer_tenure_90d,
+
+        tsys.applid,
+        tsys.card_number,
+        tsys.card_open_date,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                app.application_number,
+                tsys.card_number
+
+            ORDER BY
+                ABS(
+                    DATEDIFF(
+                        tsys.card_open_date,
+                        app.application_date
+                    )
+                ),
+                tsys.card_open_date
+        ) AS row_num
+
+    FROM mbna_application_base app
+
+    LEFT JOIN mbna_tsys_base tsys
+        ON tsys.applid = app.account_number
+
+       AND tsys.card_open_date >= DATE_SUB(
+            app.application_date,
+            7
+       )
+
+       AND tsys.card_open_date <= DATE_ADD(
+            app.application_date,
+            30
+       )
+)
 
 SELECT
-    CAST(act.application_number AS STRING) AS application_number,
-    MAX(act.date_updated) AS latest_fraud_action_date
+    application_number,
+    account_number,
+    load_date,
+    application_date,
+    date_account_opened,
+    transit_number,
+    customer_tenure_90d,
+    applid,
+    card_number,
+    card_open_date
 
-FROM hive_metastore.fiqm.tdct_rt_action act
-CROSS JOIN pda_parameters p
+FROM card_candidates
 
-WHERE
-    act.application_number LIKE 'P%D%'
-    AND UPPER(TRIM(act.action_status_code)) IN ('H', 'S')
+WHERE row_num = 1;
 
-    AND act.date_updated >= p.start_date
-    AND act.date_updated < DATE_ADD(p.end_date, 1)
+%sql
 
-GROUP BY
-    CAST(act.application_number AS STRING);
+CREATE OR REPLACE TEMP VIEW mbna_application_actions AS
 
+WITH filtered_actions AS (
+    SELECT
+        CAST(act.application_number AS STRING) AS application_number,
+        TO_DATE(act.date_updated) AS fraud_date,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY CAST(act.application_number AS STRING)
+            ORDER BY act.date_updated DESC
+        ) AS row_num
+
+    FROM hive_metastore.fiqm.tdct_rt_action act
+    CROSS JOIN mbna_parameters p
+
+    WHERE
+        CAST(act.application_number AS STRING) RLIKE '^[A-F]'
+
+        AND UPPER(TRIM(act.action_status_code)) IN ('H', 'S')
+
+        AND act.date_updated >= p.start_date
+        AND act.date_updated < DATE_ADD(p.end_date, 1)
+)
+
+SELECT
+    application_number,
+    fraud_date
+
+FROM filtered_actions
+
+WHERE row_num = 1;
 
 
 %sql
 
-CREATE OR REPLACE TEMP VIEW pda_application_fraud_base AS
+CREATE OR REPLACE TEMP VIEW mbna_application_fraud_cards AS
+
+SELECT
+    cards.application_number,
+    cards.transit_number,
+    cards.customer_tenure_90d,
+    cards.card_number,
+    actions.fraud_date,
+    'APPLICATION_ACTION' AS fraud_source
+
+FROM mbna_application_cards cards
+
+INNER JOIN mbna_application_actions actions
+    ON cards.application_number = actions.application_number
+
+WHERE cards.card_number IS NOT NULL;
+
+
+%sql
+
+CREATE OR REPLACE TEMP VIEW mbna_tsys_fraud_cards AS
+
+WITH filtered_card_frauds AS (
+    SELECT
+        applid,
+        card_number,
+
+        COALESCE(
+            secure_fraud_status_date,
+            card_open_date
+        ) AS fraud_date,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY card_number
+            ORDER BY
+                COALESCE(
+                    secure_fraud_status_date,
+                    card_open_date
+                ) ASC
+        ) AS row_num
+
+    FROM mbna_tsys_base
+    CROSS JOIN mbna_parameters p
+
+    WHERE
+        stc_secure_fraud IS NOT NULL
+
+        AND COALESCE(
+            secure_fraud_status_date,
+            card_open_date
+        ) >= p.start_date
+
+        AND COALESCE(
+            secure_fraud_status_date,
+            card_open_date
+        ) < DATE_ADD(p.end_date, 1)
+)
+
+SELECT
+    applid,
+    card_number,
+    fraud_date
+
+FROM filtered_card_frauds
+
+WHERE row_num = 1;
+
+
+%sql
+
+CREATE OR REPLACE TEMP VIEW mbna_direct_card_frauds AS
 
 SELECT
     app.application_number,
-    app.application_date,
-    app.customer_since_date,
+    app.transit_number,
     app.customer_tenure_90d,
+    fraud.card_number,
+    fraud.fraud_date,
+    'TSYS_CARD_FRAUD' AS fraud_source
+
+FROM mbna_tsys_fraud_cards fraud
+
+LEFT JOIN mbna_application_base app
+    ON fraud.applid = app.account_number
+
+WHERE app.application_number IS NOT NULL;
+
+
+
+%sql
+
+CREATE OR REPLACE TEMP VIEW mbna_fraud_cards_base AS
+
+WITH combined_frauds AS (
+    SELECT
+        application_number,
+        transit_number,
+        customer_tenure_90d,
+        card_number,
+        fraud_date,
+        fraud_source
+
+    FROM mbna_application_fraud_cards
+
+    UNION ALL
+
+    SELECT
+        application_number,
+        transit_number,
+        customer_tenure_90d,
+        card_number,
+        fraud_date,
+        fraud_source
+
+    FROM mbna_direct_card_frauds
+),
+
+canonical_fraud AS (
+    SELECT
+        application_number,
+        transit_number,
+        customer_tenure_90d,
+        card_number,
+
+        MIN(fraud_date) AS fraud_date,
+
+        CONCAT_WS(
+            ',',
+            SORT_ARRAY(
+                COLLECT_SET(fraud_source)
+            )
+        ) AS fraud_sources
+
+    FROM combined_frauds
+
+    GROUP BY
+        application_number,
+        transit_number,
+        customer_tenure_90d,
+        card_number
+)
+
+SELECT *
+FROM canonical_fraud;
+
+
+%sql
+
+CREATE OR REPLACE TEMP VIEW mbna_alerted_applications AS
+
+SELECT DISTINCT
+    CAST(m.application_number AS STRING) AS application_number
+
+FROM hive_metastore.fiqm.tdct_rt_match m
+
+WHERE TRIM(m.task_name) IN (
+    'MBNA_CUETS - T1 - Global Match Applicant',
+    'MBNA_CUETS - T1 - Global Match Employer',
+    'MBNA_CUETS - T1 - Global SIN/ID Warnings',
+    'MBNA_CUETS - T1 - High Risk List Match or Velocity',
+    'MBNA_CUETS - T1 - Local Applicant Match (Fraud or UI)',
+    'MBNA_CUETS - T1 - Local Employer Match (Fraud or UI)',
+    'MBNA_CUETS - T2 - Global Match Equifax Data Breach rules'
+);
+
+%sql
+
+CREATE OR REPLACE TEMP VIEW mbna_fraud_cards AS
+
+SELECT
+    fraud.application_number,
+    fraud.transit_number,
+    fraud.customer_tenure_90d,
+    fraud.card_number,
+    fraud.fraud_date,
+    fraud.fraud_sources,
 
     CASE
-        WHEN fraud.application_number IS NOT NULL THEN 1
+        WHEN alert.application_number IS NOT NULL THEN 1
         ELSE 0
-    END AS fraud_flag,
+    END AS alerted_fraud_ind
 
-    fraud.latest_fraud_action_date
+FROM mbna_fraud_cards_base fraud
 
-FROM pda_applications app
-
-LEFT JOIN pda_fraud_actions fraud
-    ON app.application_number = fraud.application_number;
+LEFT JOIN mbna_alerted_applications alert
+    ON fraud.application_number = alert.application_number;
 
 
 %sql
 
-WITH app_periods AS (
+WITH application_periods AS (
 
     -- ========================================================
     -- MONTHLY
     -- ========================================================
     SELECT
         'MONTHLY' AS reporting_period,
-        DATE_FORMAT(application_date, 'yyyy-MM') AS period_label,
-        COUNT(DISTINCT application_number) AS num_apps
+        DATE_FORMAT(load_date, 'yyyy-MM') AS period_label,
 
-    FROM pda_application_fraud_base
+        COUNT(DISTINCT application_number) AS num_apps,
+        COUNT(DISTINCT card_number) AS num_cards
 
-    GROUP BY
-        DATE_FORMAT(application_date, 'yyyy-MM')
+    FROM mbna_application_cards
+
+    GROUP BY DATE_FORMAT(load_date, 'yyyy-MM')
 
 
     UNION ALL
@@ -267,14 +441,15 @@ WITH app_periods AS (
             DATE_FORMAT(p.previous_month_end, 'yyyy-MM-dd')
         ) AS period_label,
 
-        COUNT(DISTINCT d.application_number) AS num_apps
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.previous_month_start
-        AND d.application_date < DATE_ADD(p.previous_month_end, 1)
+        d.load_date >= p.previous_month_start
+        AND d.load_date < DATE_ADD(p.previous_month_end, 1)
 
     GROUP BY
         p.previous_month_start,
@@ -296,14 +471,15 @@ WITH app_periods AS (
             DATE_FORMAT(p.end_date, 'yyyy-MM-dd')
         ) AS period_label,
 
-        COUNT(DISTINCT d.application_number) AS num_apps
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.current_mtd_start
-        AND d.application_date < DATE_ADD(p.end_date, 1)
+        d.load_date >= p.current_mtd_start
+        AND d.load_date < DATE_ADD(p.end_date, 1)
 
     GROUP BY
         p.current_mtd_start,
@@ -325,14 +501,15 @@ WITH app_periods AS (
             DATE_FORMAT(p.week_end, 'yyyy-MM-dd')
         ) AS period_label,
 
-        COUNT(DISTINCT d.application_number) AS num_apps
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.week_start
-        AND d.application_date < DATE_ADD(p.week_end, 1)
+        d.load_date >= p.week_start
+        AND d.load_date < DATE_ADD(p.week_end, 1)
 
     GROUP BY
         p.week_start,
@@ -346,18 +523,28 @@ fraud_periods AS (
     -- ========================================================
     SELECT
         'MONTHLY' AS reporting_period,
-        DATE_FORMAT(application_date, 'yyyy-MM') AS period_label,
+        DATE_FORMAT(fraud_date, 'yyyy-MM') AS period_label,
+
+        COUNT(DISTINCT application_number) AS num_fraud_apps,
+        COUNT(DISTINCT card_number) AS num_fraud_cards,
 
         COUNT(
             DISTINCT CASE
-                WHEN fraud_flag = 1 THEN application_number
+                WHEN alerted_fraud_ind = 1
+                THEN application_number
             END
-        ) AS num_frauds
+        ) AS num_alerted_fraud_apps,
 
-    FROM pda_application_fraud_base
+        COUNT(
+            DISTINCT CASE
+                WHEN alerted_fraud_ind = 1
+                THEN card_number
+            END
+        ) AS num_alerted_fraud_cards
 
-    GROUP BY
-        DATE_FORMAT(application_date, 'yyyy-MM')
+    FROM mbna_fraud_cards
+
+    GROUP BY DATE_FORMAT(fraud_date, 'yyyy-MM')
 
 
     UNION ALL
@@ -375,18 +562,29 @@ fraud_periods AS (
             DATE_FORMAT(p.previous_month_end, 'yyyy-MM-dd')
         ) AS period_label,
 
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
         COUNT(
             DISTINCT CASE
-                WHEN d.fraud_flag = 1 THEN d.application_number
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.application_number
             END
-        ) AS num_frauds
+        ) AS num_alerted_fraud_apps,
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.previous_month_start
-        AND d.application_date < DATE_ADD(p.previous_month_end, 1)
+        d.fraud_date >= p.previous_month_start
+        AND d.fraud_date < DATE_ADD(p.previous_month_end, 1)
 
     GROUP BY
         p.previous_month_start,
@@ -408,18 +606,29 @@ fraud_periods AS (
             DATE_FORMAT(p.end_date, 'yyyy-MM-dd')
         ) AS period_label,
 
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
         COUNT(
             DISTINCT CASE
-                WHEN d.fraud_flag = 1 THEN d.application_number
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.application_number
             END
-        ) AS num_frauds
+        ) AS num_alerted_fraud_apps,
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.current_mtd_start
-        AND d.application_date < DATE_ADD(p.end_date, 1)
+        d.fraud_date >= p.current_mtd_start
+        AND d.fraud_date < DATE_ADD(p.end_date, 1)
 
     GROUP BY
         p.current_mtd_start,
@@ -441,18 +650,29 @@ fraud_periods AS (
             DATE_FORMAT(p.week_end, 'yyyy-MM-dd')
         ) AS period_label,
 
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
         COUNT(
             DISTINCT CASE
-                WHEN d.fraud_flag = 1 THEN d.application_number
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.application_number
             END
-        ) AS num_frauds
+        ) AS num_alerted_fraud_apps,
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.week_start
-        AND d.application_date < DATE_ADD(p.week_end, 1)
+        d.fraud_date >= p.week_start
+        AND d.fraud_date < DATE_ADD(p.week_end, 1)
 
     GROUP BY
         p.week_start,
@@ -460,61 +680,82 @@ fraud_periods AS (
 )
 
 SELECT
-    a.reporting_period,
-    a.period_label,
-    a.num_apps,
-    COALESCE(f.num_frauds, 0) AS num_frauds,
+    apps.reporting_period,
+    apps.period_label,
+
+    apps.num_apps,
+    apps.num_cards,
+
+    COALESCE(fraud.num_fraud_apps, 0) AS num_fraud_apps,
+    COALESCE(fraud.num_fraud_cards, 0) AS num_fraud_cards,
+
+    COALESCE(
+        fraud.num_alerted_fraud_apps,
+        0
+    ) AS num_alerted_fraud_apps,
+
+    COALESCE(
+        fraud.num_alerted_fraud_cards,
+        0
+    ) AS num_alerted_fraud_cards,
 
     ROUND(
-        100.0 * COALESCE(f.num_frauds, 0)
-        / NULLIF(a.num_apps, 0),
+        100.0 * COALESCE(fraud.num_fraud_apps, 0)
+        / NULLIF(apps.num_apps, 0),
         2
-    ) AS fraud_rate_pct
+    ) AS application_fraud_rate_pct,
 
-FROM app_periods a
+    ROUND(
+        100.0 * COALESCE(fraud.num_fraud_cards, 0)
+        / NULLIF(apps.num_cards, 0),
+        2
+    ) AS card_fraud_rate_pct,
 
-LEFT JOIN fraud_periods f
-    ON a.reporting_period = f.reporting_period
-   AND a.period_label = f.period_label
+    ROUND(
+        100.0 * COALESCE(fraud.num_alerted_fraud_cards, 0)
+        / NULLIF(fraud.num_fraud_cards, 0),
+        2
+    ) AS alerted_fraud_capture_rate_pct
+
+FROM application_periods apps
+
+LEFT JOIN fraud_periods fraud
+    ON apps.reporting_period = fraud.reporting_period
+   AND apps.period_label = fraud.period_label
 
 ORDER BY
-    CASE a.reporting_period
+    CASE apps.reporting_period
         WHEN 'MONTHLY' THEN 1
         WHEN 'PREVIOUS_MONTH_MTD' THEN 2
         WHEN 'CURRENT_MTD' THEN 3
         WHEN 'WEEKLY' THEN 4
         ELSE 5
     END,
-    a.period_label;
-
+    apps.period_label;
 
 
 %sql
 
-WITH app_periods AS (
+WITH application_periods AS (
 
-    -- ========================================================
-    -- MONTHLY
-    -- ========================================================
     SELECT
         'MONTHLY' AS reporting_period,
-        DATE_FORMAT(application_date, 'yyyy-MM') AS period_label,
+        DATE_FORMAT(load_date, 'yyyy-MM') AS period_label,
         customer_tenure_90d,
-        COUNT(DISTINCT application_number) AS num_apps
 
-    FROM pda_application_fraud_base
+        COUNT(DISTINCT application_number) AS num_apps,
+        COUNT(DISTINCT card_number) AS num_cards
+
+    FROM mbna_application_cards
 
     GROUP BY
-        DATE_FORMAT(application_date, 'yyyy-MM'),
+        DATE_FORMAT(load_date, 'yyyy-MM'),
         customer_tenure_90d
 
 
     UNION ALL
 
 
-    -- ========================================================
-    -- PREVIOUS MONTH MTD
-    -- ========================================================
     SELECT
         'PREVIOUS_MONTH_MTD' AS reporting_period,
 
@@ -525,14 +766,16 @@ WITH app_periods AS (
         ) AS period_label,
 
         d.customer_tenure_90d,
-        COUNT(DISTINCT d.application_number) AS num_apps
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
+
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.previous_month_start
-        AND d.application_date < DATE_ADD(p.previous_month_end, 1)
+        d.load_date >= p.previous_month_start
+        AND d.load_date < DATE_ADD(p.previous_month_end, 1)
 
     GROUP BY
         p.previous_month_start,
@@ -543,9 +786,6 @@ WITH app_periods AS (
     UNION ALL
 
 
-    -- ========================================================
-    -- CURRENT MTD
-    -- ========================================================
     SELECT
         'CURRENT_MTD' AS reporting_period,
 
@@ -556,14 +796,16 @@ WITH app_periods AS (
         ) AS period_label,
 
         d.customer_tenure_90d,
-        COUNT(DISTINCT d.application_number) AS num_apps
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
+
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.current_mtd_start
-        AND d.application_date < DATE_ADD(p.end_date, 1)
+        d.load_date >= p.current_mtd_start
+        AND d.load_date < DATE_ADD(p.end_date, 1)
 
     GROUP BY
         p.current_mtd_start,
@@ -574,9 +816,6 @@ WITH app_periods AS (
     UNION ALL
 
 
-    -- ========================================================
-    -- WEEKLY
-    -- ========================================================
     SELECT
         'WEEKLY' AS reporting_period,
 
@@ -587,14 +826,16 @@ WITH app_periods AS (
         ) AS period_label,
 
         d.customer_tenure_90d,
-        COUNT(DISTINCT d.application_number) AS num_apps
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
+
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.week_start
-        AND d.application_date < DATE_ADD(p.week_end, 1)
+        d.load_date >= p.week_start
+        AND d.load_date < DATE_ADD(p.week_end, 1)
 
     GROUP BY
         p.week_start,
@@ -604,33 +845,38 @@ WITH app_periods AS (
 
 fraud_periods AS (
 
-    -- ========================================================
-    -- MONTHLY
-    -- ========================================================
     SELECT
         'MONTHLY' AS reporting_period,
-        DATE_FORMAT(application_date, 'yyyy-MM') AS period_label,
+        DATE_FORMAT(fraud_date, 'yyyy-MM') AS period_label,
         customer_tenure_90d,
+
+        COUNT(DISTINCT application_number) AS num_fraud_apps,
+        COUNT(DISTINCT card_number) AS num_fraud_cards,
 
         COUNT(
             DISTINCT CASE
-                WHEN fraud_flag = 1 THEN application_number
+                WHEN alerted_fraud_ind = 1
+                THEN application_number
             END
-        ) AS num_frauds
+        ) AS num_alerted_fraud_apps,
 
-    FROM pda_application_fraud_base
+        COUNT(
+            DISTINCT CASE
+                WHEN alerted_fraud_ind = 1
+                THEN card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards
 
     GROUP BY
-        DATE_FORMAT(application_date, 'yyyy-MM'),
+        DATE_FORMAT(fraud_date, 'yyyy-MM'),
         customer_tenure_90d
 
 
     UNION ALL
 
 
-    -- ========================================================
-    -- PREVIOUS MONTH MTD
-    -- ========================================================
     SELECT
         'PREVIOUS_MONTH_MTD' AS reporting_period,
 
@@ -642,18 +888,29 @@ fraud_periods AS (
 
         d.customer_tenure_90d,
 
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
         COUNT(
             DISTINCT CASE
-                WHEN d.fraud_flag = 1 THEN d.application_number
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.application_number
             END
-        ) AS num_frauds
+        ) AS num_alerted_fraud_apps,
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.previous_month_start
-        AND d.application_date < DATE_ADD(p.previous_month_end, 1)
+        d.fraud_date >= p.previous_month_start
+        AND d.fraud_date < DATE_ADD(p.previous_month_end, 1)
 
     GROUP BY
         p.previous_month_start,
@@ -664,9 +921,6 @@ fraud_periods AS (
     UNION ALL
 
 
-    -- ========================================================
-    -- CURRENT MTD
-    -- ========================================================
     SELECT
         'CURRENT_MTD' AS reporting_period,
 
@@ -678,18 +932,29 @@ fraud_periods AS (
 
         d.customer_tenure_90d,
 
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
         COUNT(
             DISTINCT CASE
-                WHEN d.fraud_flag = 1 THEN d.application_number
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.application_number
             END
-        ) AS num_frauds
+        ) AS num_alerted_fraud_apps,
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.current_mtd_start
-        AND d.application_date < DATE_ADD(p.end_date, 1)
+        d.fraud_date >= p.current_mtd_start
+        AND d.fraud_date < DATE_ADD(p.end_date, 1)
 
     GROUP BY
         p.current_mtd_start,
@@ -700,9 +965,6 @@ fraud_periods AS (
     UNION ALL
 
 
-    -- ========================================================
-    -- WEEKLY
-    -- ========================================================
     SELECT
         'WEEKLY' AS reporting_period,
 
@@ -714,18 +976,29 @@ fraud_periods AS (
 
         d.customer_tenure_90d,
 
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
         COUNT(
             DISTINCT CASE
-                WHEN d.fraud_flag = 1 THEN d.application_number
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.application_number
             END
-        ) AS num_frauds
+        ) AS num_alerted_fraud_apps,
 
-    FROM pda_application_fraud_base d
-    CROSS JOIN pda_parameters p
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
 
     WHERE
-        d.application_date >= p.week_start
-        AND d.application_date < DATE_ADD(p.week_end, 1)
+        d.fraud_date >= p.week_start
+        AND d.fraud_date < DATE_ADD(p.week_end, 1)
 
     GROUP BY
         p.week_start,
@@ -734,38 +1007,356 @@ fraud_periods AS (
 )
 
 SELECT
-    a.reporting_period,
-    a.period_label,
-    a.customer_tenure_90d,
-    a.num_apps,
-    COALESCE(f.num_frauds, 0) AS num_frauds,
+    apps.reporting_period,
+    apps.period_label,
+    apps.customer_tenure_90d,
+
+    apps.num_apps,
+    apps.num_cards,
+
+    COALESCE(fraud.num_fraud_apps, 0) AS num_fraud_apps,
+    COALESCE(fraud.num_fraud_cards, 0) AS num_fraud_cards,
+
+    COALESCE(
+        fraud.num_alerted_fraud_apps,
+        0
+    ) AS num_alerted_fraud_apps,
+
+    COALESCE(
+        fraud.num_alerted_fraud_cards,
+        0
+    ) AS num_alerted_fraud_cards,
 
     ROUND(
-        100.0 * COALESCE(f.num_frauds, 0)
-        / NULLIF(a.num_apps, 0),
+        100.0 * COALESCE(fraud.num_fraud_apps, 0)
+        / NULLIF(apps.num_apps, 0),
         2
-    ) AS fraud_rate_pct
+    ) AS application_fraud_rate_pct,
 
-FROM app_periods a
+    ROUND(
+        100.0 * COALESCE(fraud.num_fraud_cards, 0)
+        / NULLIF(apps.num_cards, 0),
+        2
+    ) AS card_fraud_rate_pct,
 
-LEFT JOIN fraud_periods f
-    ON a.reporting_period = f.reporting_period
-   AND a.period_label = f.period_label
-   AND a.customer_tenure_90d = f.customer_tenure_90d
+    ROUND(
+        100.0 * COALESCE(fraud.num_alerted_fraud_cards, 0)
+        / NULLIF(fraud.num_fraud_cards, 0),
+        2
+    ) AS alerted_fraud_capture_rate_pct
+
+FROM application_periods apps
+
+LEFT JOIN fraud_periods fraud
+    ON apps.reporting_period = fraud.reporting_period
+   AND apps.period_label = fraud.period_label
+   AND apps.customer_tenure_90d = fraud.customer_tenure_90d
 
 ORDER BY
-    CASE a.reporting_period
+    CASE apps.reporting_period
         WHEN 'MONTHLY' THEN 1
         WHEN 'PREVIOUS_MONTH_MTD' THEN 2
         WHEN 'CURRENT_MTD' THEN 3
         WHEN 'WEEKLY' THEN 4
         ELSE 5
     END,
-    a.period_label,
 
-    CASE a.customer_tenure_90d
-        WHEN 'NTB' THEN 1
-        WHEN 'ETB' THEN 2
+    apps.period_label,
+
+    CASE apps.customer_tenure_90d
+        WHEN 'N2B' THEN 1
+        WHEN 'E2B' THEN 2
         WHEN 'UNKNOWN' THEN 3
         ELSE 4
     END;
+
+
+%sql
+
+WITH application_periods AS (
+
+    SELECT
+        'MONTHLY' AS reporting_period,
+        DATE_FORMAT(load_date, 'yyyy-MM') AS period_label,
+        COALESCE(transit_number, 'UNKNOWN') AS transit_number,
+
+        COUNT(DISTINCT application_number) AS num_apps,
+        COUNT(DISTINCT card_number) AS num_cards
+
+    FROM mbna_application_cards
+
+    GROUP BY
+        DATE_FORMAT(load_date, 'yyyy-MM'),
+        COALESCE(transit_number, 'UNKNOWN')
+
+
+    UNION ALL
+
+
+    SELECT
+        'PREVIOUS_MONTH_MTD' AS reporting_period,
+
+        CONCAT(
+            DATE_FORMAT(p.previous_month_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.previous_month_end, 'yyyy-MM-dd')
+        ) AS period_label,
+
+        COALESCE(d.transit_number, 'UNKNOWN') AS transit_number,
+
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
+
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
+
+    WHERE
+        d.load_date >= p.previous_month_start
+        AND d.load_date < DATE_ADD(p.previous_month_end, 1)
+
+    GROUP BY
+        p.previous_month_start,
+        p.previous_month_end,
+        COALESCE(d.transit_number, 'UNKNOWN')
+
+
+    UNION ALL
+
+
+    SELECT
+        'CURRENT_MTD' AS reporting_period,
+
+        CONCAT(
+            DATE_FORMAT(p.current_mtd_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.end_date, 'yyyy-MM-dd')
+        ) AS period_label,
+
+        COALESCE(d.transit_number, 'UNKNOWN') AS transit_number,
+
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
+
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
+
+    WHERE
+        d.load_date >= p.current_mtd_start
+        AND d.load_date < DATE_ADD(p.end_date, 1)
+
+    GROUP BY
+        p.current_mtd_start,
+        p.end_date,
+        COALESCE(d.transit_number, 'UNKNOWN')
+
+
+    UNION ALL
+
+
+    SELECT
+        'WEEKLY' AS reporting_period,
+
+        CONCAT(
+            DATE_FORMAT(p.week_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.week_end, 'yyyy-MM-dd')
+        ) AS period_label,
+
+        COALESCE(d.transit_number, 'UNKNOWN') AS transit_number,
+
+        COUNT(DISTINCT d.application_number) AS num_apps,
+        COUNT(DISTINCT d.card_number) AS num_cards
+
+    FROM mbna_application_cards d
+    CROSS JOIN mbna_parameters p
+
+    WHERE
+        d.load_date >= p.week_start
+        AND d.load_date < DATE_ADD(p.week_end, 1)
+
+    GROUP BY
+        p.week_start,
+        p.week_end,
+        COALESCE(d.transit_number, 'UNKNOWN')
+),
+
+fraud_periods AS (
+
+    SELECT
+        'MONTHLY' AS reporting_period,
+        DATE_FORMAT(fraud_date, 'yyyy-MM') AS period_label,
+        COALESCE(transit_number, 'UNKNOWN') AS transit_number,
+
+        COUNT(DISTINCT application_number) AS num_fraud_apps,
+        COUNT(DISTINCT card_number) AS num_fraud_cards,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN alerted_fraud_ind = 1
+                THEN card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards
+
+    GROUP BY
+        DATE_FORMAT(fraud_date, 'yyyy-MM'),
+        COALESCE(transit_number, 'UNKNOWN')
+
+
+    UNION ALL
+
+
+    SELECT
+        'PREVIOUS_MONTH_MTD' AS reporting_period,
+
+        CONCAT(
+            DATE_FORMAT(p.previous_month_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.previous_month_end, 'yyyy-MM-dd')
+        ) AS period_label,
+
+        COALESCE(d.transit_number, 'UNKNOWN') AS transit_number,
+
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
+
+    WHERE
+        d.fraud_date >= p.previous_month_start
+        AND d.fraud_date < DATE_ADD(p.previous_month_end, 1)
+
+    GROUP BY
+        p.previous_month_start,
+        p.previous_month_end,
+        COALESCE(d.transit_number, 'UNKNOWN')
+
+
+    UNION ALL
+
+
+    SELECT
+        'CURRENT_MTD' AS reporting_period,
+
+        CONCAT(
+            DATE_FORMAT(p.current_mtd_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.end_date, 'yyyy-MM-dd')
+        ) AS period_label,
+
+        COALESCE(d.transit_number, 'UNKNOWN') AS transit_number,
+
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
+
+    WHERE
+        d.fraud_date >= p.current_mtd_start
+        AND d.fraud_date < DATE_ADD(p.end_date, 1)
+
+    GROUP BY
+        p.current_mtd_start,
+        p.end_date,
+        COALESCE(d.transit_number, 'UNKNOWN')
+
+
+    UNION ALL
+
+
+    SELECT
+        'WEEKLY' AS reporting_period,
+
+        CONCAT(
+            DATE_FORMAT(p.week_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.week_end, 'yyyy-MM-dd')
+        ) AS period_label,
+
+        COALESCE(d.transit_number, 'UNKNOWN') AS transit_number,
+
+        COUNT(DISTINCT d.application_number) AS num_fraud_apps,
+        COUNT(DISTINCT d.card_number) AS num_fraud_cards,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN d.alerted_fraud_ind = 1
+                THEN d.card_number
+            END
+        ) AS num_alerted_fraud_cards
+
+    FROM mbna_fraud_cards d
+    CROSS JOIN mbna_parameters p
+
+    WHERE
+        d.fraud_date >= p.week_start
+        AND d.fraud_date < DATE_ADD(p.week_end, 1)
+
+    GROUP BY
+        p.week_start,
+        p.week_end,
+        COALESCE(d.transit_number, 'UNKNOWN')
+)
+
+SELECT
+    apps.reporting_period,
+    apps.period_label,
+    apps.transit_number,
+
+    apps.num_apps,
+    apps.num_cards,
+
+    COALESCE(fraud.num_fraud_apps, 0) AS num_fraud_apps,
+    COALESCE(fraud.num_fraud_cards, 0) AS num_fraud_cards,
+    COALESCE(fraud.num_alerted_fraud_cards, 0) AS num_alerted_fraud_cards,
+
+    ROUND(
+        100.0 * COALESCE(fraud.num_fraud_cards, 0)
+        / NULLIF(apps.num_cards, 0),
+        2
+    ) AS card_fraud_rate_pct,
+
+    ROUND(
+        100.0 * COALESCE(fraud.num_alerted_fraud_cards, 0)
+        / NULLIF(fraud.num_fraud_cards, 0),
+        2
+    ) AS alerted_fraud_capture_rate_pct
+
+FROM application_periods apps
+
+LEFT JOIN fraud_periods fraud
+    ON apps.reporting_period = fraud.reporting_period
+   AND apps.period_label = fraud.period_label
+   AND apps.transit_number = fraud.transit_number
+
+ORDER BY
+    CASE apps.reporting_period
+        WHEN 'MONTHLY' THEN 1
+        WHEN 'PREVIOUS_MONTH_MTD' THEN 2
+        WHEN 'CURRENT_MTD' THEN 3
+        WHEN 'WEEKLY' THEN 4
+        ELSE 5
+    END,
+    apps.period_label,
+    apps.transit_number DESC;
+
+
+
+
