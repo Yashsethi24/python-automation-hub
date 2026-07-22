@@ -606,3 +606,252 @@ ORDER BY
         WHEN 'WEEKLY' THEN 3
     END,
     a.period_label;
+
+
+-- ============================================================
+-- COMBINED KPIs BY CUSTOMER TENURE
+-- ============================================================
+
+WITH app_periods AS (
+
+    -- --------------------------------------------------------
+    -- 1. MONTHLY
+    -- --------------------------------------------------------
+    SELECT
+        'MONTHLY' AS reporting_period,
+        DATE_FORMAT(a.application_date, 'yyyy-MM') AS period_label,
+        a.customer_tenure_90d,
+        COUNT(DISTINCT a.application_number) AS num_apps
+
+    FROM loan_apps a
+
+    GROUP BY
+        DATE_FORMAT(a.application_date, 'yyyy-MM'),
+        a.customer_tenure_90d
+
+
+    UNION ALL
+
+
+    -- --------------------------------------------------------
+    -- 2. PREVIOUS MONTH MTD
+    -- Example: June 1 to June 17
+    -- --------------------------------------------------------
+    SELECT
+        'PREVIOUS_MONTH_MTD' AS reporting_period,
+        CONCAT(
+            DATE_FORMAT(p.previous_month_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.previous_month_end, 'yyyy-MM-dd')
+        ) AS period_label,
+        a.customer_tenure_90d,
+        COUNT(DISTINCT a.application_number) AS num_apps
+
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        a.application_date >= p.previous_month_start
+        AND a.application_date < DATE_ADD(p.previous_month_end, 1)
+
+    GROUP BY
+        p.previous_month_start,
+        p.previous_month_end,
+        a.customer_tenure_90d
+
+
+    UNION ALL
+
+
+    -- --------------------------------------------------------
+    -- 3. CURRENT MONTH MTD
+    -- Example: July 1 to July 17
+    -- --------------------------------------------------------
+    SELECT
+        'CURRENT_MTD' AS reporting_period,
+        CONCAT(
+            DATE_FORMAT(p.current_mtd_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.end_date, 'yyyy-MM-dd')
+        ) AS period_label,
+        a.customer_tenure_90d,
+        COUNT(DISTINCT a.application_number) AS num_apps
+
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        a.application_date >= p.current_mtd_start
+        AND a.application_date < DATE_ADD(p.end_date, 1)
+
+    GROUP BY
+        p.current_mtd_start,
+        p.end_date,
+        a.customer_tenure_90d
+
+
+    UNION ALL
+
+
+    -- --------------------------------------------------------
+    -- 4. WEEKLY
+    -- --------------------------------------------------------
+    SELECT
+        'WEEKLY' AS reporting_period,
+        CONCAT(
+            DATE_FORMAT(p.week_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.week_end, 'yyyy-MM-dd')
+        ) AS period_label,
+        a.customer_tenure_90d,
+        COUNT(DISTINCT a.application_number) AS num_apps
+
+    FROM loan_apps a
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        a.application_date >= p.week_start
+        AND a.application_date < DATE_ADD(p.week_end, 1)
+
+    GROUP BY
+        p.week_start,
+        p.week_end,
+        a.customer_tenure_90d
+),
+
+fraud_periods AS (
+
+    -- --------------------------------------------------------
+    -- 1. MONTHLY
+    -- --------------------------------------------------------
+    SELECT
+        'MONTHLY' AS reporting_period,
+        DATE_FORMAT(f.date_updated, 'yyyy-MM') AS period_label,
+        f.customer_tenure_90d,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+
+    FROM loan_frauds f
+
+    GROUP BY
+        DATE_FORMAT(f.date_updated, 'yyyy-MM'),
+        f.customer_tenure_90d
+
+
+    UNION ALL
+
+
+    -- --------------------------------------------------------
+    -- 2. PREVIOUS MONTH MTD
+    -- --------------------------------------------------------
+    SELECT
+        'PREVIOUS_MONTH_MTD' AS reporting_period,
+        CONCAT(
+            DATE_FORMAT(p.previous_month_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.previous_month_end, 'yyyy-MM-dd')
+        ) AS period_label,
+        f.customer_tenure_90d,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        f.date_updated >= p.previous_month_start
+        AND f.date_updated < DATE_ADD(p.previous_month_end, 1)
+
+    GROUP BY
+        p.previous_month_start,
+        p.previous_month_end,
+        f.customer_tenure_90d
+
+
+    UNION ALL
+
+
+    -- --------------------------------------------------------
+    -- 3. CURRENT MONTH MTD
+    -- --------------------------------------------------------
+    SELECT
+        'CURRENT_MTD' AS reporting_period,
+        CONCAT(
+            DATE_FORMAT(p.current_mtd_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.end_date, 'yyyy-MM-dd')
+        ) AS period_label,
+        f.customer_tenure_90d,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        f.date_updated >= p.current_mtd_start
+        AND f.date_updated < DATE_ADD(p.end_date, 1)
+
+    GROUP BY
+        p.current_mtd_start,
+        p.end_date,
+        f.customer_tenure_90d
+
+
+    UNION ALL
+
+
+    -- --------------------------------------------------------
+    -- 4. WEEKLY
+    -- --------------------------------------------------------
+    SELECT
+        'WEEKLY' AS reporting_period,
+        CONCAT(
+            DATE_FORMAT(p.week_start, 'yyyy-MM-dd'),
+            ' to ',
+            DATE_FORMAT(p.week_end, 'yyyy-MM-dd')
+        ) AS period_label,
+        f.customer_tenure_90d,
+        COUNT(DISTINCT f.application_number) AS num_frauds
+
+    FROM loan_frauds f
+    CROSS JOIN loan_parameters p
+
+    WHERE
+        f.date_updated >= p.week_start
+        AND f.date_updated < DATE_ADD(p.week_end, 1)
+
+    GROUP BY
+        p.week_start,
+        p.week_end,
+        f.customer_tenure_90d
+)
+
+SELECT
+    a.reporting_period,
+    a.period_label,
+    a.customer_tenure_90d,
+    a.num_apps,
+    COALESCE(f.num_frauds, 0) AS num_frauds,
+
+    ROUND(
+        100.0 * COALESCE(f.num_frauds, 0)
+        / NULLIF(a.num_apps, 0),
+        2
+    ) AS fraud_rate_pct
+
+FROM app_periods a
+
+LEFT JOIN fraud_periods f
+    ON a.reporting_period = f.reporting_period
+    AND a.period_label = f.period_label
+    AND COALESCE(a.customer_tenure_90d, 'UNKNOWN')
+        = COALESCE(f.customer_tenure_90d, 'UNKNOWN')
+
+ORDER BY
+    CASE a.reporting_period
+        WHEN 'MONTHLY' THEN 1
+        WHEN 'PREVIOUS_MONTH_MTD' THEN 2
+        WHEN 'CURRENT_MTD' THEN 3
+        WHEN 'WEEKLY' THEN 4
+        ELSE 5
+    END,
+    a.period_label,
+    a.customer_tenure_90d DESC;
