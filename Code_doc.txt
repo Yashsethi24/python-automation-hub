@@ -1,48 +1,103 @@
-# Optional: standardize names before joining
-for col in ['Primary_first_name', 'Primary_family_name']:
-    df[col] = (
-        df[col]
-        .astype(str)
-        .str.strip()
-        .str.upper()
-    )
+import pandas as pd
 
-for col in ['CustomerStAddressFirstName', 'CustomerStAddressLastName']:
-    df_final[col] = (
-        df_final[col]
-        .astype(str)
-        .str.strip()
-        .str.upper()
-    )
+X = custom_df.drop(columns=['Fraud_ind', 'Alert_ind'])
+y = custom_df['Fraud_ind']
 
-# Left join
-df_merged = df.merge(
-    df_final,
-    how='left',
-    left_on=['Primary_first_name', 'Primary_family_name'],
-    right_on=['CustomerStAddressFirstName', 'CustomerStAddressLastName']
-)
-
-citadel_cols = [
-    'CustomerStAddressFirstName',
-    'CustomerStAddressLastName',
-    'Application_Number',
-    'Application_Date',
-    'Data_Source'
+binary_cols = [
+    'IsCustomerEmailPopularityLow',
+    'IsCustomerEmailPopularityMedium',
+    'IsCustomerEmailPopularityHigh',
+    'IsCustomerEmailVelocityLow',
+    'IsCustomerEmailVelocityMedium',
+    'IsCustomerEmailVelocityHigh',
+    'IsCustomerEmailAgeLow',
+    'IsCustomerEmailAgeMedium',
+    'IsCustomerEmailAgeHigh'
 ]
 
-df_merged = df.merge(
-    df_final[citadel_cols],
-    how='left',
-    left_on=['Primary_first_name', 'Primary_family_name'],
-    right_on=['CustomerStAddressFirstName', 'CustomerStAddressLastName']
+for col in binary_cols:
+    X[col] = X[col].astype(int)
+
+X['IPCountry'] = X['IPCountry'].fillna('UNKNOWN')
+X['IPCarrier'] = X['IPCarrier'].fillna('UNKNOWN')
+X['IPRegion'] = X['IPRegion'].fillna('UNKNOWN')
+
+top = X['IPCarrier'].value_counts().nlargest(20).index
+
+X['IPCarrier'] = X['IPCarrier'].where(
+    X['IPCarrier'].isin(top),
+    'OTHER'
 )
 
-df_final = (
-    df_final.sort_values('Application_Date', ascending=False)
-            .drop_duplicates(
-                subset=['CustomerStAddressFirstName',
-                        'CustomerStAddressLastName'],
-                keep='first'
-            )
+X['EmailDomain'] = (
+    X['CustomerEmails']
+      .str.split('@')
+      .str[-1]
+      .str.lower()
 )
+
+X['PostalPrefix'] = X['CustomerStdAddressPostalCode'].str[:3]
+
+X['AreaCode'] = (
+    X['CustomerPhoneNumber']
+      .astype(str)
+      .str[:3]
+)
+
+device_freq = X['DeviceTag'].value_counts()
+
+X['DeviceFrequency'] = X['DeviceTag'].map(device_freq)
+
+
+
+cat_cols = X.select_dtypes(include='object').columns
+
+X = pd.get_dummies(
+    X,
+    columns=cat_cols,
+    dummy_na=True
+)
+
+from sklearn.tree import DecisionTreeClassifier
+
+tree = DecisionTreeClassifier(
+    max_depth=4,
+    min_samples_leaf=30,
+    class_weight='balanced',
+    random_state=42
+)
+
+
+tree.fit(X, y)
+
+from sklearn.tree import export_text
+
+rules = export_text(
+    tree,
+    feature_names=list(X.columns)
+)
+
+print(rules)
+
+leaf = tree.apply(X)
+
+summary = (
+    pd.DataFrame({
+        'Leaf': leaf,
+        'Fraud': y
+    })
+    .groupby('Leaf')
+    .agg(
+        Total=('Fraud','size'),
+        Fraud=('Fraud','sum')
+    )
+)
+
+summary['Genuine'] = summary['Total'] - summary['Fraud']
+summary['Precision'] = summary['Fraud'] / summary['Total']
+
+summary.sort_values(
+    'Precision',
+    ascending=False
+)
+
