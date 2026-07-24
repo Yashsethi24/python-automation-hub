@@ -1,103 +1,41 @@
 import pandas as pd
+import glob
+import os
 
-X = custom_df.drop(columns=['Fraud_ind', 'Alert_ind'])
-y = custom_df['Fraud_ind']
+base_path = "/Workspace/Users/yash.sethi@td.com/PDA/PDA Uploads Historical/"
 
-binary_cols = [
-    'IsCustomerEmailPopularityLow',
-    'IsCustomerEmailPopularityMedium',
-    'IsCustomerEmailPopularityHigh',
-    'IsCustomerEmailVelocityLow',
-    'IsCustomerEmailVelocityMedium',
-    'IsCustomerEmailVelocityHigh',
-    'IsCustomerEmailAgeLow',
-    'IsCustomerEmailAgeMedium',
-    'IsCustomerEmailAgeHigh'
-]
-
-for col in binary_cols:
-    X[col] = X[col].astype(int)
-
-X['IPCountry'] = X['IPCountry'].fillna('UNKNOWN')
-X['IPCarrier'] = X['IPCarrier'].fillna('UNKNOWN')
-X['IPRegion'] = X['IPRegion'].fillna('UNKNOWN')
-
-top = X['IPCarrier'].value_counts().nlargest(20).index
-
-X['IPCarrier'] = X['IPCarrier'].where(
-    X['IPCarrier'].isin(top),
-    'OTHER'
+# Find CSV files in the folder and all subfolders
+csv_files = glob.glob(
+    os.path.join(base_path, "**", "*.csv"),
+    recursive=True
 )
 
-X['EmailDomain'] = (
-    X['CustomerEmails']
-      .str.split('@')
-      .str[-1]
-      .str.lower()
+print(f"Number of CSV files found: {len(csv_files)}")
+
+# Read and combine all CSV files
+pdf = pd.concat(
+    [
+        pd.read_csv(
+            file,
+            dtype=str,              # optional: prevents inconsistent type inference
+            low_memory=False
+        )
+        for file in csv_files
+    ],
+    ignore_index=True
 )
 
-X['PostalPrefix'] = X['CustomerStdAddressPostalCode'].str[:3]
+print(pdf.shape)
+display(pdf.head())
 
-X['AreaCode'] = (
-    X['CustomerPhoneNumber']
-      .astype(str)
-      .str[:3]
+spark_df = spark.createDataFrame(pdf)
+
+table_name = "catalog_name.schema_name.final_data_snapshot"
+
+(
+    spark_df.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(table_name)
 )
-
-device_freq = X['DeviceTag'].value_counts()
-
-X['DeviceFrequency'] = X['DeviceTag'].map(device_freq)
-
-
-
-cat_cols = X.select_dtypes(include='object').columns
-
-X = pd.get_dummies(
-    X,
-    columns=cat_cols,
-    dummy_na=True
-)
-
-from sklearn.tree import DecisionTreeClassifier
-
-tree = DecisionTreeClassifier(
-    max_depth=4,
-    min_samples_leaf=30,
-    class_weight='balanced',
-    random_state=42
-)
-
-
-tree.fit(X, y)
-
-from sklearn.tree import export_text
-
-rules = export_text(
-    tree,
-    feature_names=list(X.columns)
-)
-
-print(rules)
-
-leaf = tree.apply(X)
-
-summary = (
-    pd.DataFrame({
-        'Leaf': leaf,
-        'Fraud': y
-    })
-    .groupby('Leaf')
-    .agg(
-        Total=('Fraud','size'),
-        Fraud=('Fraud','sum')
-    )
-)
-
-summary['Genuine'] = summary['Total'] - summary['Fraud']
-summary['Precision'] = summary['Fraud'] / summary['Total']
-
-summary.sort_values(
-    'Precision',
-    ascending=False
-)
-
