@@ -1,29 +1,36 @@
-import pandas as pd
-
-def summarize(df):
-    return pd.Series({
-        "Total Applications": df.shape[0],
-        "Total Frauds": df["fraud_ind"].eq(1).sum(),
-        "Total Confirmed Frauds": df["conf_fraud_ind"].eq(1).sum(),
-        "Total Suspected Frauds": df["suspected_fraud"].eq(1).sum(),
-        "Total Current Balance": df["cur_bal_tot"].sum()
-    })
-
-overall_summary = summarize(amz_om5_final_df)
-
+# Filter
 filtered_df = amz_om5_final_df[
     (amz_om5_final_df["Address_Province"] == "QC") &
     (~amz_om5_final_df["recommendeddecision"].isin([366, 367, 368]))
 ]
 
-filtered_summary = summarize(filtered_df)
-
-summary = pd.concat(
-    [overall_summary, filtered_summary],
-    axis=1
+# Overall monthly summary
+overall_summary = (
+    amz_om5_final_df
+    .groupby("Application_mon")
+    .agg(
+        Total_Applications=("Application_mon", "size"),
+        Total_Frauds=("fraud_ind", lambda x: (x == 1).sum()),
+        Total_Confirmed_Frauds=("conf_fraud_ind", lambda x: (x == 1).sum()),
+        Total_Suspected_Frauds=("suspected_fraud", lambda x: (x == 1).sum()),
+        Total_Cur_Bal=("cur_bal_tot", "sum")
+    )
+    .reset_index()
 )
 
-summary.columns = ["Overall", "QC & Decision Not 366/367/368"]
+# Monthly summary for QC & recommendeddecision not in 366/367/368
+filtered_summary = (
+    filtered_df
+    .groupby("Application_mon")
+    .agg(
+        Total_Applications=("Application_mon", "size"),
+        Total_Frauds=("fraud_ind", lambda x: (x == 1).sum()),
+        Total_Confirmed_Frauds=("conf_fraud_ind", lambda x: (x == 1).sum()),
+        Total_Suspected_Frauds=("suspected_fraud", lambda x: (x == 1).sum()),
+        Total_Cur_Bal=("cur_bal_tot", "sum")
+    )
+    .reset_index()
+)
 
-print(summary)
-
+print(overall_summary)
+print(filtered_summary)
