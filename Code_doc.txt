@@ -1,36 +1,315 @@
-# Filter
-filtered_df = amz_om5_final_df[
-    (amz_om5_final_df["Address_Province"] == "QC") &
-    (~amz_om5_final_df["recommendeddecision"].isin([366, 367, 368]))
+from pyspark.sql import functions as F
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+application_col = "Application_Number"
+confirmed_fraud_col = "CONF_APP_FRAUD"
+suspected_fraud_col = "SUSPECTED_FRAUD"
+
+cu_columns = [
+    "CU305",
+    "CU305.1",
+    "CU306",
+    "CU306.1",
+    "CU307",
+    "CU307.1"
 ]
 
-# Overall monthly summary
-overall_summary = (
-    amz_om5_final_df
-    .groupby("Application_mon")
-    .agg(
-        Total_Applications=("Application_mon", "size"),
-        Total_Frauds=("fraud_ind", lambda x: (x == 1).sum()),
-        Total_Confirmed_Frauds=("conf_fraud_ind", lambda x: (x == 1).sum()),
-        Total_Suspected_Frauds=("suspected_fraud", lambda x: (x == 1).sum()),
-        Total_Cur_Bal=("cur_bal_tot", "sum")
+# ============================================================
+# 2. CONVERT PANDAS DATAFRAME TO SPARK
+# ============================================================
+
+tuidx_app_spark = spark.createDataFrame(manual_alert_upload)
+
+
+# Keep only the required columns from the TU-IDX file
+tuidx_app_spark = (
+    tuidx_app_spark
+    .select(
+        application_col,
+        *cu_columns
     )
-    .reset_index()
+    .withColumn(
+        application_col,
+        F.trim(F.col(application_col).cast("string"))
+    )
 )
 
-# Monthly summary for QC & recommendeddecision not in 366/367/368
-filtered_summary = (
-    filtered_df
-    .groupby("Application_mon")
-    .agg(
-        Total_Applications=("Application_mon", "size"),
-        Total_Frauds=("fraud_ind", lambda x: (x == 1).sum()),
-        Total_Confirmed_Frauds=("conf_fraud_ind", lambda x: (x == 1).sum()),
-        Total_Suspected_Frauds=("suspected_fraud", lambda x: (x == 1).sum()),
-        Total_Cur_Bal=("cur_bal_tot", "sum")
+
+# Standardize Y/N values
+for column in cu_columns:
+    tuidx_app_spark = tuidx_app_spark.withColumn(
+        column,
+        F.when(
+            F.upper(F.trim(F.col(column).cast("string"))).isin("Y", "N"),
+            F.upper(F.trim(F.col(column).cast("string")))
+        )
     )
-    .reset_index()
+
+
+# Remove exact duplicate rows
+tuidx_app_spark = tuidx_app_spark.dropDuplicates()
+
+# ============================================================
+# 3. CONSOLIDATE TO ONE ROW PER APPLICATION
+# ============================================================
+
+cu_aggregation = []
+
+for column in cu_columns:
+    cu_aggregation.append(
+        F.when(
+            F.max(
+                F.when(F.col(column) == "Y", 1).otherwise(0)
+            ) == 1,
+            "Y"
+        )
+        .when(
+            F.max(
+                F.when(F.col(column) == "N", 1).otherwise(0)
+            ) == 1,
+            "N"
+        )
+        .otherwise(None)
+        .alias(column)
+    )
+
+
+tuidx_app_spark = (
+    tuidx_app_spark
+    .groupBy(application_col)
+    .agg(*cu_aggregation)
 )
 
-print(overall_summary)
-print(filtered_summary)
+# ============================================================
+# 4. PREPARE FRAUD FLAGS
+# ============================================================
+
+fraud_flags = (
+    june_df
+    .select(
+        application_col,
+        confirmed_fraud_col,
+        suspected_fraud_col
+    )
+    .withColumn(
+        application_col,
+        F.trim(F.col(application_col).cast("string"))
+    )
+    .filter(F.col(application_col).isNotNull())
+    .groupBy(application_col)
+    .agg(
+        F.max(
+            F.coalesce(
+                F.col(confirmed_fraud_col).cast("int"),
+                F.lit(0)
+            )
+        ).alias(confirmed_fraud_col),
+
+        F.max(
+            F.coalesce(
+                F.col(suspected_fraud_col).cast("int"),
+                F.lit(0)
+            )
+        ).alias(suspected_fraud_col)
+    )
+)
+# ============================================================
+# 5. JOIN CU VARIABLES TO FRAUD DATA
+# ============================================================
+
+merged_df = (
+    tuidx_app_spark.alias("t")
+    .join(
+        fraud_flags.alias("f"),
+        on=application_col,
+        how="left"
+    )
+    .fillna(
+        {
+            confirmed_fraud_col: 0,
+            suspected_fraud_col: 0
+        }
+    )
+)
+
+
+# ============================================================
+# 6. CREATE PORTFOLIO
+# ============================================================
+
+merged_df = merged_df.withColumn(
+    "Portfolio",
+    F.when(
+        F.upper(F.substring(F.col(application_col), 1, 1))
+        .isin("A", "B", "C", "D", "E", "F"),
+        "MBNA"
+    ).otherwise("TDCT")
+)
+
+# ============================================================
+# 7. UNPIVOT CU COLUMNS
+# ============================================================
+
+stack_expression = ", ".join(
+    [f"'{column}', `{column}`" for column in cu_columns]
+)
+
+long_df = merged_df.selectExpr(
+    application_col,
+    "Portfolio",
+    confirmed_fraud_col,
+    suspected_fraud_col,
+    f"stack({len(cu_columns)}, {stack_expression}) "
+    f"as (CU_Variable, CU_Value)"
+)
+
+# ============================================================
+# 8. CALCULATE Y/N COUNTS AND FRAUD RATES AMONG Y
+# ============================================================
+
+final_summary = (
+    long_df
+    .groupBy(
+        "Portfolio",
+        "CU_Variable"
+    )
+    .agg(
+        # Applications with Y
+        F.countDistinct(
+            F.when(
+                F.col("CU_Value") == "Y",
+                F.col(application_col)
+            )
+        ).alias("Y_Applications"),
+
+        # Applications with N
+        F.countDistinct(
+            F.when(
+                F.col("CU_Value") == "N",
+                F.col(application_col)
+            )
+        ).alias("N_Applications"),
+
+        # Applications with either Y or N
+        F.countDistinct(
+            F.when(
+                F.col("CU_Value").isin("Y", "N"),
+                F.col(application_col)
+            )
+        ).alias("Y_or_N_Applications"),
+
+        # Applications where field is null or another value
+        F.countDistinct(
+            F.when(
+                F.col("CU_Value").isNull(),
+                F.col(application_col)
+            )
+        ).alias("Null_Applications"),
+
+        # Confirmed fraud among Y applications
+        F.countDistinct(
+            F.when(
+                (F.col("CU_Value") == "Y") &
+                (F.col(confirmed_fraud_col) == 1),
+                F.col(application_col)
+            )
+        ).alias("Confirmed_Fraud_Y"),
+
+        # Suspected fraud among Y applications
+        F.countDistinct(
+            F.when(
+                (F.col("CU_Value") == "Y") &
+                (F.col(suspected_fraud_col) == 1),
+                F.col(application_col)
+            )
+        ).alias("Suspected_Fraud_Y")
+    )
+    .withColumn(
+        "Y_Rate",
+        F.when(
+            F.col("Y_or_N_Applications") > 0,
+            F.col("Y_Applications") /
+            F.col("Y_or_N_Applications")
+        )
+    )
+    .withColumn(
+        "N_Rate",
+        F.when(
+            F.col("Y_or_N_Applications") > 0,
+            F.col("N_Applications") /
+            F.col("Y_or_N_Applications")
+        )
+    )
+    .withColumn(
+        "Confirmed_Fraud_Rate_Among_Y",
+        F.when(
+            F.col("Y_Applications") > 0,
+            F.col("Confirmed_Fraud_Y") /
+            F.col("Y_Applications")
+        )
+    )
+    .withColumn(
+        "Suspected_Fraud_Rate_Among_Y",
+        F.when(
+            F.col("Y_Applications") > 0,
+            F.col("Suspected_Fraud_Y") /
+            F.col("Y_Applications")
+        )
+    )
+    .orderBy(
+        "Portfolio",
+        "CU_Variable"
+    )
+)
+# ============================================================
+# 9. DISPLAY-FRIENDLY FORMAT
+# ============================================================
+
+final_summary_display = (
+    final_summary
+    .withColumn(
+        "Y_Rate",
+        F.format_string("%.2f%%", F.col("Y_Rate") * 100)
+    )
+    .withColumn(
+        "N_Rate",
+        F.format_string("%.2f%%", F.col("N_Rate") * 100)
+    )
+    .withColumn(
+        "Confirmed_Fraud_Rate_Among_Y",
+        F.format_string(
+            "%.2f%%",
+            F.col("Confirmed_Fraud_Rate_Among_Y") * 100
+        )
+    )
+    .withColumn(
+        "Suspected_Fraud_Rate_Among_Y",
+        F.format_string(
+            "%.2f%%",
+            F.col("Suspected_Fraud_Rate_Among_Y") * 100
+        )
+    )
+)
+
+display(final_summary_display)
+mbna_summary = (
+    final_summary_display
+    .filter(F.col("Portfolio") == "MBNA")
+    .drop("Portfolio")
+)
+
+tdct_summary = (
+    final_summary_display
+    .filter(F.col("Portfolio") == "TDCT")
+    .drop("Portfolio")
+)
+
+print("MBNA")
+display(mbna_summary)
+
+print("TDCT")
+display(tdct_summary)
