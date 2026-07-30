@@ -5,16 +5,14 @@ import time
 
 def get_volume_interface():
     devices = AudioUtilities.GetSpeakers()
-    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    interface = devices._dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
     return cast(interface, POINTER(IAudioEndpointVolume))
 
 def change_volume_by_one_step(up=True):
     volume = get_volume_interface()
-    # Get current volume (0.0 to 1.0)
     current = volume.GetMasterVolumeLevelScalar()
     
-    # One step is roughly 0.02 (about 2%)
-    step = 0.02
+    step = 0.02   # roughly one volume step
     if up:
         new_vol = min(1.0, current + step)
     else:
@@ -26,10 +24,10 @@ def main():
     print("Volume toggler started. Press Ctrl+C to stop.")
     try:
         while True:
-            change_volume_by_one_step(up=True)   # Volume up
+            change_volume_by_one_step(up=True)    # Volume up
             time.sleep(0.3)
-            change_volume_by_one_step(up=False)  # Volume down
-            time.sleep(30)  # Wait 30 seconds before next cycle (adjust as needed)
+            change_volume_by_one_step(up=False)   # Volume down
+            time.sleep(30)                        # Wait 30 seconds (change if needed)
     except KeyboardInterrupt:
         print("\nStopped.")
 
