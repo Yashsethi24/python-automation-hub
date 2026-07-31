@@ -1,35 +1,1322 @@
-from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-import time
+# Databricks notebook source
 
-def get_volume_interface():
-    devices = AudioUtilities.GetSpeakers()
-    interface = devices._dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-    return cast(interface, POINTER(IAudioEndpointVolume))
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 
-def change_volume_by_one_step(up=True):
-    volume = get_volume_interface()
-    current = volume.GetMasterVolumeLevelScalar()
-    
-    step = 0.02   # roughly one volume step
-    if up:
-        new_vol = min(1.0, current + step)
-    else:
-        new_vol = max(0.0, current - step)
-    
-    volume.SetMasterVolumeLevelScalar(new_vol, None)
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import StructType
 
-def main():
-    print("Volume toggler started. Press Ctrl+C to stop.")
+
+# COMMAND ----------
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Source tables
+APPLICATIONS_TABLE = "hive_metastore.fiqm.applications"
+ACTION_TABLE       = "hive_metastore.fiqm.tdct_rt_action"
+MATCH_TABLE        = "hive_metastore.fiqm.tdct_rt_match"
+TSYS_MBNA_TABLE    = "tsys.v_cfm_tsys_mbna_acct_slim"
+
+# Use a Unity Catalog volume, DBFS location, or mounted storage path.
+# Change these paths to your actual Databricks storage location.
+BASE_PATH = "/Volumes/<catalog>/<schema>/<volume>/mbna_fraud_monitoring"
+
+HISTORY_PATH = f"{BASE_PATH}/history/mbna_fraud_history"
+DAILY_OUTPUT_BASE_PATH = f"{BASE_PATH}/daily"
+BACKUP_BASE_PATH = f"{BASE_PATH}/backup"
+
+# Use CSV output as requested.
+OUTPUT_FORMAT = "csv"
+
+# Business parameters
+TIME_ZONE = "America/Toronto"
+
+# Address mismatch process begins from this date.
+ADDRESS_MISMATCH_START_DATE = "2025-01-01"
+
+# SMC/MBR lookback period.
+SMC_MBR_LOOKBACK_DAYS = 7
+
+# Account opening period around application date.
+OPEN_DATE_DAYS_AFTER_APPLICATION = 30
+OPEN_DATE_DAYS_BEFORE_APPLICATION = 7
+
+# Confirmed fraud timing.
+CONFIRMED_FRAUD_DAYS = 90
+
+# Values used by the original script.
+SUSPICIOUS_AUTH_CODES = ["L7", "L8"]
+
+# Product codes used for SMC/MBR.
+SMC_MBR_PRODUCT_CODES = ["SMC", "MBR"]
+
+# Task names used to remove applications already sent as alerts.
+ALERT_TASK_NAME_PATTERN = "MBNA%"
+EXCLUDED_TASK_NAME_PATTERN = "%MBNA_CUETS RETRO%"
+
+# Deduplication keys.
+# Report_Type is included so the same account may independently appear
+# in Address_Mismatch and SMC_MBR.
+HISTORY_KEY_COLUMNS = [
+    "Report_Type",
+    "Application_Number",
+    "ACCT_NUM_TA1"
+]
+
+
+# COMMAND ----------
+
+now_toronto = datetime.now(ZoneInfo(TIME_ZONE))
+run_date = now_toronto.date()
+
+smc_mbr_start_date = run_date - timedelta(days=SMC_MBR_LOOKBACK_DAYS)
+
+run_date_string = run_date.strftime("%Y-%m-%d")
+run_date_compact = run_date.strftime("%Y%m%d")
+
+daily_output_path = (
+    f"{DAILY_OUTPUT_BASE_PATH}/run_date={run_date_string}"
+)
+
+print(f"Run date: {run_date_string}")
+print(f"SMC/MBR start date: {smc_mbr_start_date}")
+print(f"History path: {HISTORY_PATH}")
+print(f"Daily output path: {daily_output_path}")
+
+# COMMAND ----------
+
+def path_exists(path: str) -> bool:
+    """
+    Check whether a Databricks/DBFS/Volume path exists.
+    """
     try:
-        while True:
-            change_volume_by_one_step(up=True)    # Volume up
-            time.sleep(0.3)
-            change_volume_by_one_step(up=False)   # Volume down
-            time.sleep(30)                        # Wait 30 seconds (change if needed)
-    except KeyboardInterrupt:
-        print("\nStopped.")
+        dbutils.fs.ls(path)
+        return True
+    except Exception:
+        return False
 
-if __name__ == "__main__":
-    main()
+# COMMAND ----------
+
+def normalize_column_names(df: DataFrame) -> DataFrame:
+    """
+    Standardize column names for CSV output and future reads.
+
+    Replaces spaces and selected punctuation with underscores.
+    """
+    output_df = df
+
+    for old_name in df.columns:
+        new_name = (
+            old_name.strip()
+            .replace(" ", "_")
+            .replace("-", "_")
+            .replace("/", "_")
+            .replace(".", "_")
+            .replace("(", "")
+            .replace(")", "")
+        )
+
+        while "__" in new_name:
+            new_name = new_name.replace("__", "_")
+
+        if old_name != new_name:
+            output_df = output_df.withColumnRenamed(old_name, new_name)
+
+    return output_df
+
+# COMMAND ----------
+
+def align_dataframes(
+    first_df: DataFrame,
+    second_df: DataFrame
+) -> tuple[DataFrame, DataFrame]:
+    """
+    Add missing columns to each DataFrame so unionByName can be used safely.
+    """
+    first_columns = set(first_df.columns)
+    second_columns = set(second_df.columns)
+
+    for column_name in second_columns - first_columns:
+        data_type = second_df.schema[column_name].dataType
+        first_df = first_df.withColumn(
+            column_name,
+            F.lit(None).cast(data_type)
+        )
+
+    for column_name in first_columns - second_columns:
+        data_type = first_df.schema[column_name].dataType
+        second_df = second_df.withColumn(
+            column_name,
+            F.lit(None).cast(data_type)
+        )
+
+    ordered_columns = sorted(set(first_df.columns).union(second_df.columns))
+
+    return (
+        first_df.select(*ordered_columns),
+        second_df.select(*ordered_columns)
+    )
+
+# COMMAND ----------
+
+def read_csv_if_exists(
+    path: str,
+    schema: StructType | None = None
+) -> DataFrame | None:
+    """
+    Read a CSV folder if it exists.
+
+    Spark writes CSV output as a directory containing part files.
+    """
+    if not path_exists(path):
+        return None
+
+    reader = (
+        spark.read
+        .option("header", True)
+        .option("inferSchema", schema is None)
+    )
+
+    if schema is not None:
+        reader = reader.schema(schema)
+
+    return reader.csv(path)
+
+
+# COMMAND ----------
+
+def get_new_records(
+    current_df: DataFrame,
+    history_df: DataFrame | None,
+    key_columns: list[str]
+) -> DataFrame:
+    """
+    Return only current records that do not already exist in history.
+
+    Uses null-safe string keys and a Spark left-anti join.
+    """
+    current_df = current_df.dropDuplicates(key_columns)
+
+    if history_df is None:
+        return current_df
+
+    available_keys = [
+        column_name
+        for column_name in key_columns
+        if column_name in current_df.columns
+        and column_name in history_df.columns
+    ]
+
+    if not available_keys:
+        raise ValueError(
+            "No valid history key columns exist in both current and "
+            "historical DataFrames."
+        )
+
+    current_keys = current_df.select(
+        *[
+            F.coalesce(
+                F.col(column_name).cast("string"),
+                F.lit("__NULL__")
+            ).alias(column_name)
+            for column_name in available_keys
+        ]
+    ).dropDuplicates()
+
+    history_keys = history_df.select(
+        *[
+            F.coalesce(
+                F.col(column_name).cast("string"),
+                F.lit("__NULL__")
+            ).alias(column_name)
+            for column_name in available_keys
+        ]
+    ).dropDuplicates()
+
+    current_with_keys = current_df
+
+    for column_name in available_keys:
+        current_with_keys = current_with_keys.withColumn(
+            f"__key_{column_name}",
+            F.coalesce(
+                F.col(column_name).cast("string"),
+                F.lit("__NULL__")
+            )
+        )
+
+    history_keys_renamed = history_keys.select(
+        *[
+            F.col(column_name).alias(f"__key_{column_name}")
+            for column_name in available_keys
+        ]
+    )
+
+    join_columns = [
+        f"__key_{column_name}"
+        for column_name in available_keys
+    ]
+
+    new_records = current_with_keys.join(
+        history_keys_renamed,
+        on=join_columns,
+        how="left_anti"
+    )
+
+    return new_records.drop(*join_columns)
+
+
+# COMMAND ----------
+
+def write_csv(
+    df: DataFrame,
+    path: str,
+    mode: str = "overwrite",
+    single_file: bool = False
+) -> None:
+    """
+    Write a Spark DataFrame as CSV.
+
+    single_file=True uses coalesce(1), which is appropriate only for
+    reasonably small operational reports.
+    """
+    output_df = df.coalesce(1) if single_file else df
+
+    (
+        output_df.write
+        .format("csv")
+        .mode(mode)
+        .option("header", True)
+        .option("emptyValue", "")
+        .option("nullValue", "")
+        .option("timestampFormat", "yyyy-MM-dd HH:mm:ss")
+        .option("dateFormat", "yyyy-MM-dd")
+        .save(path)
+    )
+
+
+
+# COMMAND ----------
+
+def create_history_backup(
+    history_path: str,
+    backup_base_path: str,
+    run_timestamp: datetime
+) -> None:
+    """
+    Create a dated copy of the existing historical CSV folder.
+    """
+    if not path_exists(history_path):
+        print("No historical file exists yet. Backup skipped.")
+        return
+
+    timestamp_string = run_timestamp.strftime("%Y%m%d_%H%M%S")
+    backup_path = f"{backup_base_path}/history_{timestamp_string}"
+
+    dbutils.fs.cp(
+        history_path,
+        backup_path,
+        recurse=True
+    )
+
+    print(f"History backup created: {backup_path}")
+
+
+
+# COMMAND ----------
+
+USE_BUSINESS_DAY_CHECK = False
+
+BUSINESS_CALENDAR_TABLE = (
+    "hive_metastore.<schema>.<business_calendar_table>"
+)
+
+def is_processing_day(process_date: date) -> bool:
+    """
+    Return True when the process should run.
+
+    When no calendar table is configured, weekends are excluded and
+    weekdays are processed.
+    """
+    if process_date.weekday() >= 5:
+        return False
+
+    if not USE_BUSINESS_DAY_CHECK:
+        return True
+
+    calendar_result = (
+        spark.table(BUSINESS_CALENDAR_TABLE)
+        .filter(F.col("calendar_date") == F.lit(process_date))
+        .select(
+            F.coalesce(
+                F.col("is_business_day"),
+                F.lit(False)
+            ).alias("is_business_day")
+        )
+        .limit(1)
+        .collect()
+    )
+
+    if not calendar_result:
+        raise ValueError(
+            f"No calendar record found for {process_date}."
+        )
+
+    return bool(calendar_result[0]["is_business_day"])
+
+
+
+# COMMAND ----------
+
+print("APPLICATIONS TABLE")
+spark.table(APPLICATIONS_TABLE).printSchema()
+
+print("ACTION TABLE")
+spark.table(ACTION_TABLE).printSchema()
+
+print("MATCH TABLE")
+spark.table(MATCH_TABLE).printSchema()
+
+print("TSYS MBNA TABLE")
+spark.table(TSYS_MBNA_TABLE).printSchema()
+# COMMAND ----------
+
+applications_raw = spark.table(APPLICATIONS_TABLE)
+
+applications = (
+    applications_raw
+    .select(
+        F.col("Application_Number")
+            .cast("string")
+            .alias("Application_Number"),
+
+        F.to_date("Application_Date")
+            .alias("Application_Date"),
+
+        F.col("Account_Number")
+            .cast("string")
+            .alias("Account_Number"),
+
+        F.col("Primary_First_Name")
+            .cast("string")
+            .alias("Primary_First_Name"),
+
+        F.col("Primary_Middle_Name")
+            .cast("string")
+            .alias("Primary_Middle_Name"),
+
+        F.col("Primary_Family_Name")
+            .cast("string")
+            .alias("Primary_Family_Name"),
+
+        F.col("Address_Street")
+            .cast("string")
+            .alias("Address_Street"),
+
+        F.col("Address_City")
+            .cast("string")
+            .alias("Address_City"),
+
+        F.col("Address_Province")
+            .cast("string")
+            .alias("Address_Province"),
+
+        F.col("Address_Postal_Code")
+            .cast("string")
+            .alias("Address_Postal_Code"),
+
+        F.col("Employment_Income")
+            .cast("double")
+            .alias("Employment_Income"),
+
+        F.col("Data_Source")
+            .cast("string")
+            .alias("Data_Source"),
+
+        F.col("Transit_Number")
+            .cast("string")
+            .alias("Transit_Number")
+    )
+    .filter(
+        F.upper(F.substring("Application_Number", 1, 1))
+        .isin("A", "B", "C", "D", "E", "F")
+    )
+)
+
+
+
+# COMMAND ----------
+
+tsys_raw = spark.table(TSYS_MBNA_TABLE)
+
+tsys_accounts = (
+    tsys_raw
+    .select(
+        F.col("APPLID")
+            .cast("string")
+            .alias("APPLID"),
+
+        F.col("APPLID_SUF")
+            .cast("string")
+            .alias("APPLID_SUF"),
+
+        F.col("ACCT_NUM_TA1")
+            .cast("string")
+            .alias("ACCT_NUM_TA1"),
+
+        F.to_date("OPEN_DT")
+            .alias("OPEN_DT"),
+
+        F.to_date("BIRTH_DT")
+            .alias("TSYS_BIRTH_DT"),
+
+        F.col("NAME")
+            .cast("string")
+            .alias("TSYS_NAME"),
+
+        F.col("ADDRESS1")
+            .cast("string")
+            .alias("TSYS_ADDRESS1"),
+
+        F.col("CITY")
+            .cast("string")
+            .alias("TSYS_CITY"),
+
+        F.col("STATE")
+            .cast("string")
+            .alias("TSYS_STATE"),
+
+        F.col("ZIP")
+            .cast("string")
+            .alias("TSYS_ZIP"),
+
+        F.col("CLIENT_PROD_CD")
+            .cast("string")
+            .alias("CLIENT_PROD_CD"),
+
+        F.col("STATC_TIERED_AUTH")
+            .cast("string")
+            .alias("STATC_TIERED_AUTH"),
+
+        F.to_timestamp("STC_SEC_FRAUD_DT")
+            .alias("STC_SEC_FRAUD_DT"),
+
+        F.col("STC_SECURE_FRAUD")
+            .cast("string")
+            .alias("STC_SECURE_FRAUD"),
+
+        F.col("STC_CR_REVOKED")
+            .cast("string")
+            .alias("STC_CR_REVOKED"),
+
+        F.col("STC_CLOSE")
+            .cast("string")
+            .alias("STC_CLOSE")
+    )
+    .filter(F.col("ACCT_NUM_TA1").isNotNull())
+)
+
+
+
+# COMMAND ----------
+
+address_applications = (
+    applications
+    .filter(
+        F.col("Application_Date")
+        >= F.to_date(F.lit(ADDRESS_MISMATCH_START_DATE))
+    )
+    .filter(F.col("Address_Province").isNotNull())
+    .withColumn(
+        "Application_Name",
+        F.trim(
+            F.concat_ws(
+                " ",
+                F.col("Primary_First_Name"),
+                F.col("Primary_Family_Name")
+            )
+        )
+    )
+    .withColumn(
+        "Application_Name_Alternate",
+        F.concat_ws(
+            "%",
+            F.col("Primary_First_Name"),
+            F.col("Primary_Family_Name")
+        )
+    )
+)
+
+
+# COMMAND ----------
+
+address_mismatch_current = (
+    address_applications.alias("app")
+    .join(
+        tsys_accounts.alias("cc"),
+        F.col("cc.APPLID") == F.col("app.Account_Number"),
+        "inner"
+    )
+    .filter(
+        F.upper(F.trim(F.col("app.Address_Province")))
+        != F.upper(F.trim(F.col("cc.TSYS_STATE")))
+    )
+    .filter(
+        F.datediff(
+            F.col("cc.OPEN_DT"),
+            F.col("app.Application_Date")
+        ).between(0, OPEN_DATE_DAYS_AFTER_APPLICATION)
+    )
+    .select(
+        F.lit("Address_Mismatch").alias("Report_Type"),
+
+        F.col("app.Application_Date"),
+        F.col("cc.OPEN_DT"),
+
+        F.col("cc.ACCT_NUM_TA1"),
+        F.col("app.Application_Number"),
+        F.col("app.Account_Number"),
+
+        F.col("app.Application_Name"),
+        F.col("app.Application_Name_Alternate"),
+
+        F.col("cc.TSYS_NAME"),
+        F.col("cc.TSYS_BIRTH_DT"),
+
+        F.col("cc.TSYS_ADDRESS1"),
+        F.col("cc.TSYS_CITY"),
+        F.col("cc.TSYS_STATE").alias("TSYS_Province"),
+        F.col("cc.TSYS_ZIP"),
+
+        F.col("app.Address_Street")
+            .alias("Application_Address"),
+
+        F.col("app.Address_City")
+            .alias("Application_City"),
+
+        F.col("app.Address_Province")
+            .alias("Application_Province"),
+
+        F.col("app.Address_Postal_Code")
+            .alias("Application_Postal_Code"),
+
+        F.col("app.Employment_Income"),
+
+        F.col("cc.CLIENT_PROD_CD"),
+        F.col("cc.STATC_TIERED_AUTH"),
+
+        F.lit(None).cast("int").alias("Suspicious_Indicator"),
+        F.lit(None).cast("int").alias("Confirmed_Fraud_Indicator"),
+        F.lit(None).cast("string").alias("Fraud_Tagged"),
+        F.lit(None).cast("timestamp").alias("App_Fraud_Marked_Date"),
+        F.lit(None).cast("int").alias("Alert_Indicator"),
+
+        F.current_timestamp().alias("Run_Timestamp"),
+        F.current_date().alias("Run_Date")
+    )
+    .dropDuplicates(
+        [
+            "Report_Type",
+            "Application_Number",
+            "ACCT_NUM_TA1"
+        ]
+    )
+)
+
+
+# COMMAND ----------
+
+smc_mbr_applications = (
+    applications
+    .filter(
+        F.col("Application_Date")
+        >= F.lit(smc_mbr_start_date)
+    )
+)
+
+
+# COMMAND ----------
+
+application_card_condition = (
+    (
+        F.col("c.APPLID") == F.col("a.Account_Number")
+    )
+    &
+    (
+        (
+            F.col("c.OPEN_DT") >= F.col("a.Application_Date")
+        )
+        &
+        (
+            F.col("c.OPEN_DT")
+            < F.date_add(
+                F.col("a.Application_Date"),
+                OPEN_DATE_DAYS_AFTER_APPLICATION
+            )
+        )
+    )
+)
+
+# COMMAND ----------
+
+direct_card_matches = (
+    smc_mbr_applications.alias("a")
+    .join(
+        tsys_accounts.alias("c"),
+        application_card_condition,
+        "inner"
+    )
+)
+
+# COMMAND ----------
+
+fallback_card_condition = (
+    (
+        F.upper(F.trim(F.col("c.TSYS_NAME")))
+        ==
+        F.upper(
+            F.trim(
+                F.concat_ws(
+                    " ",
+                    F.col("a.Primary_First_Name"),
+                    F.col("a.Primary_Family_Name")
+                )
+            )
+        )
+    )
+    &
+    (
+        F.upper(F.trim(F.col("c.TSYS_ZIP")))
+        ==
+        F.upper(
+            F.regexp_replace(
+                F.trim(F.col("a.Address_Postal_Code")),
+                " ",
+                ""
+            )
+        )
+    )
+    &
+    (
+        F.col("c.OPEN_DT")
+        < F.col("a.Application_Date")
+    )
+    &
+    (
+        F.col("c.OPEN_DT")
+        >= F.date_sub(
+            F.col("a.Application_Date"),
+            OPEN_DATE_DAYS_BEFORE_APPLICATION
+        )
+    )
+)
+
+# COMMAND ----------
+
+fallback_card_matches = (
+    smc_mbr_applications.alias("a")
+    .join(
+        tsys_accounts.alias("c"),
+        fallback_card_condition,
+        "inner"
+    )
+)
+
+# COMMAND ----------
+
+cards_base = (
+    direct_card_matches
+    .unionByName(
+        fallback_card_matches,
+        allowMissingColumns=True
+    )
+    .filter(F.col("c.APPLID_SUF") == "0")
+    .filter(F.col("c.STC_CR_REVOKED").isNull())
+    .filter(F.col("c.STC_CLOSE").isNull())
+    .filter(F.col("c.ACCT_NUM_TA1").isNotNull())
+    .filter(F.col("c.CLIENT_PROD_CD").isin(SMC_MBR_PRODUCT_CODES))
+    .select(
+        F.col("a.Application_Date"),
+        F.col("a.Application_Number"),
+        F.col("a.Account_Number"),
+        F.col("a.Data_Source"),
+        F.col("a.Transit_Number"),
+
+        F.col("a.Primary_First_Name"),
+        F.col("a.Primary_Middle_Name"),
+        F.col("a.Primary_Family_Name"),
+
+        F.col("a.Address_Street")
+            .alias("Application_Address"),
+
+        F.col("a.Address_City")
+            .alias("Application_City"),
+
+        F.col("a.Address_Province")
+            .alias("Application_Province"),
+
+        F.col("a.Address_Postal_Code")
+            .alias("Application_Postal_Code"),
+
+        F.col("c.APPLID"),
+        F.col("c.APPLID_SUF"),
+        F.col("c.ACCT_NUM_TA1"),
+        F.col("c.OPEN_DT"),
+
+        F.col("c.TSYS_BIRTH_DT"),
+        F.col("c.TSYS_NAME"),
+        F.col("c.TSYS_ADDRESS1"),
+        F.col("c.TSYS_CITY"),
+        F.col("c.TSYS_STATE"),
+        F.col("c.TSYS_ZIP"),
+
+        F.col("c.CLIENT_PROD_CD"),
+        F.col("c.STATC_TIERED_AUTH"),
+        F.col("c.STC_SEC_FRAUD_DT"),
+        F.col("c.STC_SECURE_FRAUD")
+    )
+    .dropDuplicates(
+        [
+            "Application_Number",
+            "ACCT_NUM_TA1"
+        ]
+    )
+)
+
+
+# COMMAND ----------
+
+cards_with_indicators = (
+    cards_base
+    .withColumn(
+        "Suspicious_Indicator",
+        F.when(
+            F.col("STATC_TIERED_AUTH").isin(SUSPICIOUS_AUTH_CODES),
+            F.lit(1)
+        ).otherwise(F.lit(0))
+    )
+    .withColumn(
+        "Confirmed_Fraud_Indicator",
+        F.when(
+            F.col("STC_SEC_FRAUD_DT").isNotNull()
+            &
+            (
+                F.datediff(
+                    F.to_date("STC_SEC_FRAUD_DT"),
+                    F.col("OPEN_DT")
+                ).between(0, CONFIRMED_FRAUD_DAYS)
+            ),
+            F.lit(1)
+        ).otherwise(F.lit(0))
+    )
+)
+
+
+# COMMAND ----------
+
+non_fraud_suspicious_cards = (
+    cards_with_indicators
+    .filter(
+        (F.col("Suspicious_Indicator") == 0)
+        &
+        (F.col("Confirmed_Fraud_Indicator") == 0)
+    )
+)
+
+
+# COMMAND ----------
+
+actions_raw = spark.table(ACTION_TABLE)
+
+actions = (
+    actions_raw
+    .select(
+        F.col("Application_Number")
+            .cast("string")
+            .alias("Application_Number"),
+
+        F.col("Action_Status_Code")
+            .cast("string")
+            .alias("Action_Status_Code"),
+
+        F.to_timestamp("Date_Updated")
+            .alias("Date_Updated"),
+
+        F.to_date("Start_Date")
+            .alias("Start_Date")
+    )
+    .filter(
+        F.upper(F.col("Action_Status_Code"))
+        .isin("H", "S")
+    )
+)
+
+
+# COMMAND ----------
+
+latest_action_window = (
+    Window
+    .partitionBy("Application_Number")
+    .orderBy(F.col("Date_Updated").desc_nulls_last())
+)
+
+latest_fraud_action = (
+    actions
+    .withColumn(
+        "action_rank",
+        F.row_number().over(latest_action_window)
+    )
+    .filter(F.col("action_rank") == 1)
+    .drop("action_rank")
+    .select(
+        "Application_Number",
+        F.col("Date_Updated")
+            .alias("App_Fraud_Marked_Date"),
+        F.col("Action_Status_Code")
+            .alias("Fraud_Action_Status"),
+        F.col("Start_Date")
+            .alias("Fraud_Action_Start_Date")
+    )
+)
+
+
+# COMMAND ----------
+
+cards_with_fraud_tag = (
+    non_fraud_suspicious_cards.alias("cards")
+    .join(
+        latest_fraud_action.alias("action"),
+        on="Application_Number",
+        how="left"
+    )
+    .withColumn(
+        "Fraud_Tagged",
+        F.when(
+            F.col("Fraud_Action_Status").isNotNull(),
+            F.lit("Yes")
+        ).otherwise(F.lit("No"))
+    )
+)
+
+
+# COMMAND ----------
+
+matches_raw = spark.table(MATCH_TABLE)
+
+matches = (
+    matches_raw
+    .select(
+        F.col("Application_Number")
+            .cast("string")
+            .alias("Application_Number"),
+
+        F.col("Task_Name")
+            .cast("string")
+            .alias("Task_Name"),
+
+        F.to_timestamp("Create_Date_Time")
+            .alias("Create_Date_Time")
+    )
+    .filter(
+        F.upper(F.col("Task_Name")).like(ALERT_TASK_NAME_PATTERN)
+    )
+    .filter(
+        ~F.upper(F.col("Task_Name")).like(
+            EXCLUDED_TASK_NAME_PATTERN
+        )
+    )
+    .filter(
+        F.to_date("Create_Date_Time")
+        >= F.lit(smc_mbr_start_date)
+    )
+    .select("Application_Number")
+    .dropDuplicates()
+    .withColumn("Alert_Indicator", F.lit(1))
+)
+
+
+# COMMAND ----------
+
+smc_mbr_current = (
+    cards_with_fraud_tag.alias("cards")
+    .join(
+        matches.alias("match"),
+        on="Application_Number",
+        how="left"
+    )
+    .withColumn(
+        "Alert_Indicator",
+        F.coalesce(
+            F.col("Alert_Indicator"),
+            F.lit(0)
+        )
+    )
+    .filter(F.col("Alert_Indicator") == 0)
+    .filter(F.col("Application_Date") >= F.lit(smc_mbr_start_date))
+    .select(
+        F.lit("SMC_MBR").alias("Report_Type"),
+
+        F.col("Application_Date"),
+        F.col("OPEN_DT"),
+
+        F.col("ACCT_NUM_TA1"),
+        F.col("Application_Number"),
+        F.col("Account_Number"),
+
+        F.trim(
+            F.concat_ws(
+                " ",
+                F.col("Primary_First_Name"),
+                F.col("Primary_Family_Name")
+            )
+        ).alias("Application_Name"),
+
+        F.concat_ws(
+            "%",
+            F.col("Primary_First_Name"),
+            F.col("Primary_Family_Name")
+        ).alias("Application_Name_Alternate"),
+
+        F.col("TSYS_NAME"),
+        F.col("TSYS_BIRTH_DT"),
+
+        F.col("TSYS_ADDRESS1"),
+        F.col("TSYS_CITY"),
+        F.col("TSYS_STATE").alias("TSYS_Province"),
+        F.col("TSYS_ZIP"),
+
+        F.col("Application_Address"),
+        F.col("Application_City"),
+        F.col("Application_Province"),
+        F.col("Application_Postal_Code"),
+
+        F.lit(None).cast("double").alias("Employment_Income"),
+
+        F.col("CLIENT_PROD_CD"),
+        F.col("STATC_TIERED_AUTH"),
+
+        F.col("Suspicious_Indicator"),
+        F.col("Confirmed_Fraud_Indicator"),
+
+        F.col("Fraud_Tagged"),
+        F.col("App_Fraud_Marked_Date"),
+        F.col("Alert_Indicator"),
+
+        F.col("Data_Source"),
+        F.col("Transit_Number"),
+
+        F.current_timestamp().alias("Run_Timestamp"),
+        F.current_date().alias("Run_Date")
+    )
+    .dropDuplicates(
+        [
+            "Report_Type",
+            "Application_Number",
+            "ACCT_NUM_TA1"
+        ]
+    )
+)
+
+
+# COMMAND ----------
+
+print(
+    "SMC/MBR current count:",
+    smc_mbr_current.count()
+)
+
+display(
+    smc_mbr_current
+    .orderBy(F.col("Application_Date").desc())
+)
+
+
+
+# COMMAND ----------
+
+address_aligned, smc_aligned = align_dataframes(
+    address_mismatch_current,
+    smc_mbr_current
+)
+
+combined_current = (
+    address_aligned
+    .unionByName(smc_aligned)
+    .dropDuplicates(HISTORY_KEY_COLUMNS)
+)
+
+combined_current = normalize_column_names(combined_current)# COMMAND ----------
+
+print("Combined current count:", combined_current.count())
+
+display(
+    combined_current
+    .groupBy("Report_Type")
+    .agg(
+        F.count("*").alias("Record_Count"),
+        F.countDistinct("Application_Number")
+            .alias("Application_Count"),
+        F.countDistinct("ACCT_NUM_TA1")
+            .alias("Account_Count")
+    )
+)
+
+
+
+# COMMAND ----------
+
+history_df = read_csv_if_exists(
+    HISTORY_PATH,
+    schema=combined_current.schema
+)
+
+if history_df is None:
+    print("Historical CSV does not exist. All current records are new.")
+else:
+    history_df = normalize_column_names(history_df)
+
+    print("Historical count:", history_df.count())
+
+    display(
+        history_df
+        .groupBy("Report_Type")
+        .count()
+    )
+
+
+
+# COMMAND ----------
+
+new_records = get_new_records(
+    current_df=combined_current,
+    history_df=history_df,
+    key_columns=HISTORY_KEY_COLUMNS
+)
+
+# COMMAND ----------
+
+new_record_count = new_records.count()
+
+print(f"New record count: {new_record_count}")
+
+display(
+    new_records
+    .groupBy("Report_Type")
+    .agg(
+        F.count("*").alias("New_Record_Count"),
+        F.countDistinct("Application_Number")
+            .alias("New_Application_Count")
+    )
+)
+
+# COMMAND ----------
+
+if history_df is None:
+    updated_history = new_records
+else:
+    history_aligned, new_aligned = align_dataframes(
+        history_df,
+        new_records
+    )
+
+    updated_history = (
+        history_aligned
+        .unionByName(new_aligned)
+        .dropDuplicates(HISTORY_KEY_COLUMNS)
+    )
+
+
+# COMMAND ----------
+
+processing_day = is_processing_day(run_date)
+
+print(f"Processing day: {processing_day}")
+print(f"New records available: {new_record_count}")
+
+# COMMAND ----------
+
+if new_record_count > 0 and processing_day:
+
+    # Back up existing history before overwrite.
+    create_history_backup(
+        history_path=HISTORY_PATH,
+        backup_base_path=BACKUP_BASE_PATH,
+        run_timestamp=now_toronto
+    )
+
+    # Sort daily report.
+    daily_output = (
+        new_records
+        .orderBy(
+            F.col("Report_Type"),
+            F.col("Application_Date").desc(),
+            F.col("Application_Number"),
+            F.col("ACCT_NUM_TA1")
+        )
+    )
+
+    # Daily operational CSV.
+    # coalesce(1) is suitable when this report is relatively small.
+    write_csv(
+        df=daily_output,
+        path=daily_output_path,
+        mode="overwrite",
+        single_file=True
+    )
+
+    # Combined historical CSV.
+    write_csv(
+        df=updated_history,
+        path=HISTORY_PATH,
+        mode="overwrite",
+        single_file=False
+    )
+
+    print(
+        f"Daily CSV created with {new_record_count} records:"
+        f"\n{daily_output_path}"
+    )
+
+    print(
+        f"Historical CSV updated:"
+        f"\n{HISTORY_PATH}"
+    )
+
+elif new_record_count == 0:
+    print("No new records found. Daily CSV was not created.")
+
+else:
+    print(
+        f"{run_date_string} is not a processing day. "
+        "Daily CSV and history update were skipped."
+    )
+
+
+# COMMAND ----------
+
+def rename_single_csv_part(
+    source_directory: str,
+    final_file_name: str
+) -> str:
+    """
+    Rename a single Spark CSV part file inside its output directory.
+
+    The final file remains within the same output directory.
+    """
+    files = dbutils.fs.ls(source_directory)
+
+    part_files = [
+        file_info.path
+        for file_info in files
+        if file_info.name.startswith("part-")
+        and file_info.name.endswith(".csv")
+    ]
+
+    if len(part_files) != 1:
+        raise ValueError(
+            f"Expected one CSV part file in {source_directory}, "
+            f"but found {len(part_files)}."
+        )
+
+    destination_path = (
+        f"{source_directory.rstrip('/')}/{final_file_name}"
+    )
+
+    dbutils.fs.mv(
+        part_files[0],
+        destination_path
+    )
+
+    return destination_path
+
+
+# COMMAND ----------
+
+if new_record_count > 0 and processing_day:
+
+    final_daily_file = rename_single_csv_part(
+        source_directory=daily_output_path,
+        final_file_name=(
+            f"MBNA_Fraud_Daily_{run_date_compact}.csv"
+        )
+    )
+
+    print(f"Final daily file: {final_daily_file}")
+
+
+# COMMAND ----------
+
+# Duplicate validation
+duplicate_check = (
+    updated_history
+    .groupBy(*HISTORY_KEY_COLUMNS)
+    .count()
+    .filter(F.col("count") > 1)
+)
+
+duplicate_count = duplicate_check.count()
+
+if duplicate_count > 0:
+    print(
+        f"WARNING: {duplicate_count} duplicate historical keys found."
+    )
+    display(duplicate_check)
+else:
+    print("Duplicate validation passed.")
+
+# COMMAND ----------
+
+# Null key validation
+null_key_condition = None
+
+for column_name in HISTORY_KEY_COLUMNS:
+    condition = F.col(column_name).isNull()
+
+    null_key_condition = (
+        condition
+        if null_key_condition is None
+        else null_key_condition | condition
+    )
+
+null_key_records = updated_history.filter(null_key_condition)
+null_key_count = null_key_records.count()
+
+if null_key_count > 0:
+    print(
+        f"WARNING: {null_key_count} rows contain null historical keys."
+    )
+    display(null_key_records)
+else:
+    print("Null-key validation passed.")
+
+
+# COMMAND ----------
+
+# Final summary
+final_summary = (
+    new_records
+    .groupBy("Report_Type")
+    .agg(
+        F.count("*").alias("New_Records"),
+        F.countDistinct("Application_Number")
+            .alias("New_Applications"),
+        F.sum(
+            F.coalesce(
+                F.col("Suspicious_Indicator"),
+                F.lit(0)
+            )
+        ).alias("Suspicious_Records"),
+        F.sum(
+            F.coalesce(
+                F.col("Confirmed_Fraud_Indicator"),
+                F.lit(0)
+            )
+        ).alias("Confirmed_Fraud_Records")
+    )
+    .orderBy("Report_Type")
+)
+
+display(final_summary)
