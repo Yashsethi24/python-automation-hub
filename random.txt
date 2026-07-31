@@ -1,0 +1,57 @@
+WITH tab1 AS (
+    SELECT
+        APPLICATION_NUMBER,
+        Application_date,
+        SIN,
+        DOB,
+        PRIMARY_FIRST_NAME,
+        PRIMARY_FAMILY_NAME
+    FROM hive_metastore.fiqa.applications
+    WHERE APPLICATION_NUMBER IN (
+        '38367954601'
+        -- remaining applications
+    )
+),
+
+matched_accounts AS (
+    SELECT
+        A.APPLICATION_NUMBER,
+        A.Application_date,
+        A.DOB,
+        A.PRIMARY_FIRST_NAME,
+        A.PRIMARY_FAMILY_NAME,
+
+        B.*,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY A.APPLICATION_NUMBER
+            ORDER BY B.OPEN_DT DESC
+        ) AS match_rank
+
+    FROM tab1 A
+    INNER JOIN tsys.v_cfm_tsys_tdct_acct_slim B
+        ON TO_DATE(B.BIRTH_DT) = TO_DATE(A.DOB)
+
+        AND REGEXP_REPLACE(
+                UPPER(COALESCE(B.NAME, '')),
+                '[^A-Z0-9]',
+                ''
+            )
+            =
+            REGEXP_REPLACE(
+                UPPER(
+                    CONCAT(
+                        COALESCE(A.PRIMARY_FIRST_NAME, ''),
+                        COALESCE(A.PRIMARY_FAMILY_NAME, '')
+                    )
+                ),
+                '[^A-Z0-9]',
+                ''
+            )
+
+        -- Optional:
+        -- AND TO_DATE(B.OPEN_DT) >= TO_DATE(A.Application_date)
+)
+
+SELECT *
+FROM matched_accounts;
