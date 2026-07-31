@@ -699,9 +699,156 @@ FROM
 WHERE Duplicate_Row_Number = 1;
 
 
--- ============================================================
+-- =================================================================
 -- 12. SELECT ONLY RECORDS NOT ALREADY IN HISTORY
 --
 -- Null-safe comparison is used for account number.
 -- The same account can exist once under each Report_Type.
--- ========================================
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW mbna_new_records AS
+
+SELECT current_data.*
+
+FROM mbna_combined_current_deduplicated current_data
+
+WHERE NOT EXISTS
+(
+    SELECT 1
+
+    FROM hive_metastore.fiqm.mbna_fraud_history_csv history
+
+    WHERE history.Report_Type = current_data.Report_Type
+
+      AND history.Application_Number
+          = current_data.Application_Number
+
+      AND COALESCE(history.ACCT_NUM_TA1, '')
+          = COALESCE(current_data.ACCT_NUM_TA1, '')
+);
+
+
+-- ============================================================
+-- 13. WRITE DAILY CSV
+--
+-- Data is stored under a Run_Date partition, for example:
+--
+-- daily/Run_Date=2026-07-31/
+--
+-- Running the script again on the same date replaces that
+-- date's daily partition rather than creating duplicates.
+-- ============================================================
+
+INSERT OVERWRITE TABLE hive_metastore.fiqm.mbna_fraud_daily_csv
+PARTITION (Run_Date)
+
+SELECT
+    Report_Type,
+    Application_Date,
+    OPEN_DT,
+    ACCT_NUM_TA1,
+    Application_Number,
+    Account_Number,
+    Application_Name,
+    Application_Name_Alternate,
+    TSYS_Name,
+    TSYS_Birth_Date,
+    TSYS_Address,
+    TSYS_City,
+    TSYS_Province,
+    TSYS_Postal_Code,
+    Application_Address,
+    Application_City,
+    Application_Province,
+    Application_Postal_Code,
+    Employment_Income,
+    Client_Product_Code,
+    STATC_TIERED_AUTH,
+    Suspicious_Indicator,
+    Confirmed_Fraud_Indicator,
+    Fraud_Tagged,
+    App_Fraud_Marked_Date,
+    Alert_Indicator,
+    Data_Source,
+    Transit_Number,
+    Run_Timestamp,
+    Run_Date
+
+FROM mbna_new_records;
+
+
+-- ============================================================
+-- 14. APPEND NEW RECORDS TO COMBINED HISTORICAL CSV
+-- ============================================================
+
+INSERT INTO hive_metastore.fiqm.mbna_fraud_history_csv
+
+SELECT
+    Report_Type,
+    Application_Date,
+    OPEN_DT,
+    ACCT_NUM_TA1,
+    Application_Number,
+    Account_Number,
+    Application_Name,
+    Application_Name_Alternate,
+    TSYS_Name,
+    TSYS_Birth_Date,
+    TSYS_Address,
+    TSYS_City,
+    TSYS_Province,
+    TSYS_Postal_Code,
+    Application_Address,
+    Application_City,
+    Application_Province,
+    Application_Postal_Code,
+    Employment_Income,
+    Client_Product_Code,
+    STATC_TIERED_AUTH,
+    Suspicious_Indicator,
+    Confirmed_Fraud_Indicator,
+    Fraud_Tagged,
+    App_Fraud_Marked_Date,
+    Alert_Indicator,
+    Data_Source,
+    Transit_Number,
+    Run_Timestamp,
+    Run_Date
+
+FROM mbna_new_records;
+
+
+-- ============================================================
+-- 15. RUN SUMMARY
+-- ============================================================
+
+SELECT
+    CURRENT_DATE()                                        AS Run_Date,
+    Report_Type,
+
+    COUNT(*)                                              AS New_Record_Count,
+
+    COUNT(DISTINCT Application_Number)                    AS New_Application_Count,
+
+    COUNT(DISTINCT ACCT_NUM_TA1)                          AS New_Account_Count,
+
+    SUM(
+        COALESCE(Suspicious_Indicator, 0)
+    )                                                     AS Suspicious_Record_Count,
+
+    SUM(
+        COALESCE(Confirmed_Fraud_Indicator, 0)
+    )                                                     AS Confirmed_Fraud_Record_Count,
+
+    SUM(
+        CASE
+            WHEN Fraud_Tagged = 'Yes' THEN 1
+            ELSE 0
+        END
+    )                                                     AS Fraud_Tagged_Record_Count
+
+FROM mbna_new_records
+
+GROUP BY Report_Type
+
+ORDER BY Report_Type;
