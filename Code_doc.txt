@@ -1,854 +1,105 @@
--- Databricks notebook source
--- MAGIC %sql
+import pandas as pd
 
--- ============================================================
--- COMBINED MBNA FRAUD MONITORING
--- Reports:
---   1. Address_Mismatch
---   2. SMC_MBR
---
--- Source tables:
---   hive_metastore.fiqm.applications
---   hive_metastore.fiqm.tdct_rt_action
---   hive_metastore.fiqm.tdct_rt_match
---   tsys.v_cfm_tsys_mbna_acct_slim
---
--- Output:
---   CSV-backed daily table
---   CSV-backed historical table
--- ============================================================
-
-SET TIME ZONE 'America/Toronto';
-
--- ============================================================
--- 1. OUTPUT TABLES
---
--- Replace both LOCATION values with valid Databricks storage
--- locations, such as a Unity Catalog Volume.
---
--- Example:
--- /Volumes/catalog/schema/volume/mbna_fraud/history
--- /Volumes/catalog/schema/volume/mbna_fraud/daily
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS hive_metastore.fiqm.mbna_fraud_history_csv
-(
-    Report_Type                    STRING,
-    Application_Date               DATE,
-    OPEN_DT                        DATE,
-    ACCT_NUM_TA1                   STRING,
-    Application_Number             STRING,
-    Account_Number                 STRING,
-    Application_Name               STRING,
-    Application_Name_Alternate     STRING,
-    TSYS_Name                      STRING,
-    TSYS_Birth_Date                DATE,
-    TSYS_Address                   STRING,
-    TSYS_City                      STRING,
-    TSYS_Province                  STRING,
-    TSYS_Postal_Code               STRING,
-    Application_Address            STRING,
-    Application_City               STRING,
-    Application_Province           STRING,
-    Application_Postal_Code        STRING,
-    Employment_Income              DOUBLE,
-    Client_Product_Code            STRING,
-    STATC_TIERED_AUTH              STRING,
-    Suspicious_Indicator           INT,
-    Confirmed_Fraud_Indicator      INT,
-    Fraud_Tagged                   STRING,
-    App_Fraud_Marked_Date          TIMESTAMP,
-    Alert_Indicator                INT,
-    Data_Source                    STRING,
-    Transit_Number                 STRING,
-    Run_Timestamp                  TIMESTAMP,
-    Run_Date                       DATE
+# Ensure Run_Date is datetime
+MBNA_blocks_hist_status["Run_Date"] = pd.to_datetime(
+    MBNA_blocks_hist_status["Run_Date"],
+    errors="coerce"
 )
-USING CSV
-OPTIONS
-(
-    header = 'true',
-    delimiter = ',',
-    quote = '"',
-    escape = '"',
-    nullValue = '',
-    emptyValue = '',
-    dateFormat = 'yyyy-MM-dd',
-    timestampFormat = 'yyyy-MM-dd HH:mm:ss'
+
+# Daily, weekly and monthly reporting fields
+MBNA_blocks_hist_status["Run_Day"] = (
+    MBNA_blocks_hist_status["Run_Date"].dt.normalize()
 )
-LOCATION '/Volumes/<catalog>/<schema>/<volume>/mbna_fraud/history';
 
-
-CREATE TABLE IF NOT EXISTS hive_metastore.fiqm.mbna_fraud_daily_csv
-(
-    Report_Type                    STRING,
-    Application_Date               DATE,
-    OPEN_DT                        DATE,
-    ACCT_NUM_TA1                   STRING,
-    Application_Number             STRING,
-    Account_Number                 STRING,
-    Application_Name               STRING,
-    Application_Name_Alternate     STRING,
-    TSYS_Name                      STRING,
-    TSYS_Birth_Date                DATE,
-    TSYS_Address                   STRING,
-    TSYS_City                      STRING,
-    TSYS_Province                  STRING,
-    TSYS_Postal_Code               STRING,
-    Application_Address            STRING,
-    Application_City               STRING,
-    Application_Province           STRING,
-    Application_Postal_Code        STRING,
-    Employment_Income              DOUBLE,
-    Client_Product_Code            STRING,
-    STATC_TIERED_AUTH              STRING,
-    Suspicious_Indicator           INT,
-    Confirmed_Fraud_Indicator      INT,
-    Fraud_Tagged                   STRING,
-    App_Fraud_Marked_Date          TIMESTAMP,
-    Alert_Indicator                INT,
-    Data_Source                    STRING,
-    Transit_Number                 STRING,
-    Run_Timestamp                  TIMESTAMP,
-    Run_Date                       DATE
+# Monday as the start of the week
+MBNA_blocks_hist_status["Run_Week"] = (
+    MBNA_blocks_hist_status["Run_Date"]
+    .dt.to_period("W-SUN")
+    .dt.start_time
 )
-USING CSV
-PARTITIONED BY (Run_Date)
-OPTIONS
-(
-    header = 'true',
-    delimiter = ',',
-    quote = '"',
-    escape = '"',
-    nullValue = '',
-    emptyValue = '',
-    dateFormat = 'yyyy-MM-dd',
-    timestampFormat = 'yyyy-MM-dd HH:mm:ss'
+
+# Keep year and month together so different years are not combined
+MBNA_blocks_hist_status["Run_Month"] = (
+    MBNA_blocks_hist_status["Run_Date"]
+    .dt.to_period("M")
+    .astype(str)
 )
-LOCATION '/Volumes/<catalog>/<schema>/<volume>/mbna_fraud/daily';
+
+# Create conditional account-number columns
+MBNA_blocks_hist_status["acct_still_blocked"] = (
+    MBNA_blocks_hist_status["ACCT_NUM_TA1"]
+    .where(MBNA_blocks_hist_status["susp_ind_base"].eq(1))
+)
+
+MBNA_blocks_hist_status["acct_marked_fraud"] = (
+    MBNA_blocks_hist_status["ACCT_NUM_TA1"].where(
+        MBNA_blocks_hist_status["susp_ind_base"].eq(0)
+        & MBNA_blocks_hist_status["Cnf_fraud_ind"].eq(1)
+    )
+)
+
+MBNA_blocks_hist_status["acct_unblocked"] = (
+    MBNA_blocks_hist_status["ACCT_NUM_TA1"].where(
+        MBNA_blocks_hist_status["susp_ind_base"].eq(0)
+        & MBNA_blocks_hist_status["Cnf_fraud_ind"].eq(0)
+    )
+)
 
 
--- ============================================================
--- 2. STANDARDIZE MBNA APPLICATIONS
---
--- MBNA application numbers start with A, B, C, D, E or F.
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW mbna_applications AS
-
-SELECT
-    CAST(Application_Number AS STRING)                    AS Application_Number,
-    TO_DATE(Application_Date)                            AS Application_Date,
-    CAST(Account_Number AS STRING)                        AS Account_Number,
-
-    CAST(Primary_First_Name AS STRING)                    AS Primary_First_Name,
-    CAST(Primary_Middle_Name AS STRING)                   AS Primary_Middle_Name,
-    CAST(Primary_Family_Name AS STRING)                   AS Primary_Family_Name,
-
-    TRIM(
-        CONCAT_WS(
-            ' ',
-            Primary_First_Name,
-            Primary_Family_Name
+def create_kpi_report(df, group_column):
+    return (
+        df.groupby(group_column, dropna=False)
+        .agg(
+            num_blocked=("ACCT_NUM_TA1", "nunique"),
+            num_still_blocked=("acct_still_blocked", "nunique"),
+            num_marked_fraud=("acct_marked_fraud", "nunique"),
+            num_unblocked=("acct_unblocked", "nunique")
         )
-    )                                                     AS Application_Name,
-
-    CONCAT_WS(
-        '%',
-        Primary_First_Name,
-        Primary_Family_Name
-    )                                                     AS Application_Name_Alternate,
-
-    CAST(Address_Street AS STRING)                        AS Application_Address,
-    CAST(Address_City AS STRING)                          AS Application_City,
-    CAST(Address_Province AS STRING)                      AS Application_Province,
-    CAST(Address_Postal_Code AS STRING)                   AS Application_Postal_Code,
-
-    CAST(Employment_Income AS DOUBLE)                     AS Employment_Income,
-    CAST(Data_Source AS STRING)                           AS Data_Source,
-    CAST(Transit_Number AS STRING)                        AS Transit_Number
-
-FROM hive_metastore.fiqm.applications
-
-WHERE
-       UPPER(Application_Number) LIKE 'A%'
-    OR UPPER(Application_Number) LIKE 'B%'
-    OR UPPER(Application_Number) LIKE 'C%'
-    OR UPPER(Application_Number) LIKE 'D%'
-    OR UPPER(Application_Number) LIKE 'E%'
-    OR UPPER(Application_Number) LIKE 'F%';
-
-
--- ============================================================
--- 3. STANDARDIZE TSYS ACCOUNT DATA
---
--- Confirm the two fraud columns below against printSchema:
---     STC_SEC_FRAUD_DT
---     STC_SECURE_FRAUD
---
--- Rename them here only if the physical column names differ.
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW mbna_tsys_accounts AS
-
-SELECT
-    CAST(APPLID AS STRING)                                AS APPLID,
-    CAST(APPLID_SUF AS STRING)                            AS APPLID_SUF,
-    CAST(ACCT_NUM_TA1 AS STRING)                          AS ACCT_NUM_TA1,
-
-    TO_DATE(OPEN_DT)                                      AS OPEN_DT,
-    TO_DATE(BIRTH_DT)                                     AS TSYS_Birth_Date,
-
-    CAST(NAME AS STRING)                                  AS TSYS_Name,
-    CAST(ADDRESS1 AS STRING)                              AS TSYS_Address,
-    CAST(CITY AS STRING)                                  AS TSYS_City,
-    CAST(STATE AS STRING)                                 AS TSYS_Province,
-    CAST(ZIP AS STRING)                                   AS TSYS_Postal_Code,
-
-    CAST(CLIENT_PROD_CD AS STRING)                        AS Client_Product_Code,
-    CAST(STATC_TIERED_AUTH AS STRING)                     AS STATC_TIERED_AUTH,
-
-    TO_TIMESTAMP(STC_SEC_FRAUD_DT)                        AS STC_SEC_FRAUD_DT,
-    CAST(STC_SECURE_FRAUD AS STRING)                      AS STC_SECURE_FRAUD,
-
-    CAST(STC_CR_REVOKED AS STRING)                        AS STC_CR_REVOKED,
-    CAST(STC_CLOSE AS STRING)                             AS STC_CLOSE
-
-FROM tsys.v_cfm_tsys_mbna_acct_slim
-
-WHERE ACCT_NUM_TA1 IS NOT NULL;
-
-
--- ============================================================
--- 4. ADDRESS MISMATCH REPORT
---
--- Original logic:
---   Application date from 2025-01-01
---   Application province is populated
---   Application account number matches TSYS APPLID
---   Application province differs from TSYS state
---   Card opened from application date through 30 days afterward
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW address_mismatch_current AS
-
-SELECT DISTINCT
-    'Address_Mismatch'                                    AS Report_Type,
-
-    app.Application_Date,
-    tsys.OPEN_DT,
-
-    tsys.ACCT_NUM_TA1,
-    app.Application_Number,
-    app.Account_Number,
-
-    app.Application_Name,
-    app.Application_Name_Alternate,
-
-    tsys.TSYS_Name,
-    tsys.TSYS_Birth_Date,
-    tsys.TSYS_Address,
-    tsys.TSYS_City,
-    tsys.TSYS_Province,
-    tsys.TSYS_Postal_Code,
-
-    app.Application_Address,
-    app.Application_City,
-    app.Application_Province,
-    app.Application_Postal_Code,
-
-    app.Employment_Income,
-
-    tsys.Client_Product_Code,
-    tsys.STATC_TIERED_AUTH,
-
-    CAST(NULL AS INT)                                     AS Suspicious_Indicator,
-    CAST(NULL AS INT)                                     AS Confirmed_Fraud_Indicator,
-    CAST(NULL AS STRING)                                  AS Fraud_Tagged,
-    CAST(NULL AS TIMESTAMP)                               AS App_Fraud_Marked_Date,
-    CAST(NULL AS INT)                                     AS Alert_Indicator,
-
-    app.Data_Source,
-    app.Transit_Number,
-
-    CURRENT_TIMESTAMP()                                   AS Run_Timestamp,
-    CURRENT_DATE()                                        AS Run_Date
-
-FROM mbna_applications app
-
-INNER JOIN mbna_tsys_accounts tsys
-    ON tsys.APPLID = app.Account_Number
-
-WHERE app.Application_Date >= DATE '2025-01-01'
-
-  AND app.Application_Province IS NOT NULL
-
-  AND COALESCE(
-          UPPER(TRIM(app.Application_Province)),
-          ''
-      )
-      <>
-      COALESCE(
-          UPPER(TRIM(tsys.TSYS_Province)),
-          ''
-      )
-
-  AND DATEDIFF(
-          tsys.OPEN_DT,
-          app.Application_Date
-      ) BETWEEN 0 AND 30;
-
-
--- ============================================================
--- 5. SMC/MBR CARD MAPPING
---
--- Preserves the screenshot logic:
---   Account number matches TSYS APPLID
---   Card opened up to 30 days after application
---   OR up to 7 days before application
---   APPLID suffix = 0
---   Account not revoked or closed
---   Product is SMC or MBR
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW smc_mbr_cards AS
-
-SELECT DISTINCT
-    app.Application_Date,
-    app.Application_Number,
-    app.Account_Number,
-
-    app.Application_Name,
-    app.Application_Name_Alternate,
-
-    app.Application_Address,
-    app.Application_City,
-    app.Application_Province,
-    app.Application_Postal_Code,
-    app.Employment_Income,
-
-    app.Data_Source,
-    app.Transit_Number,
-
-    tsys.APPLID,
-    tsys.APPLID_SUF,
-    tsys.ACCT_NUM_TA1,
-    tsys.OPEN_DT,
-
-    tsys.TSYS_Name,
-    tsys.TSYS_Birth_Date,
-    tsys.TSYS_Address,
-    tsys.TSYS_City,
-    tsys.TSYS_Province,
-    tsys.TSYS_Postal_Code,
-
-    tsys.Client_Product_Code,
-    tsys.STATC_TIERED_AUTH,
-    tsys.STC_SEC_FRAUD_DT,
-    tsys.STC_SECURE_FRAUD,
-
-    CASE
-        WHEN tsys.STATC_TIERED_AUTH IN ('L7', 'L8')
-            THEN 1
-        ELSE 0
-    END                                                   AS Suspicious_Indicator,
-
-    CASE
-        WHEN tsys.STC_SEC_FRAUD_DT IS NOT NULL
-         AND DATEDIFF(
-                 TO_DATE(tsys.STC_SEC_FRAUD_DT),
-                 tsys.OPEN_DT
-             ) BETWEEN 0 AND 90
-            THEN 1
-        ELSE 0
-    END                                                   AS Confirmed_Fraud_Indicator
-
-FROM mbna_applications app
-
-INNER JOIN mbna_tsys_accounts tsys
-    ON tsys.APPLID = app.Account_Number
-
-WHERE app.Application_Date >= DATE_SUB(CURRENT_DATE(), 7)
-
-  AND
-  (
-        tsys.OPEN_DT >= app.Application_Date
-    AND tsys.OPEN_DT < DATE_ADD(app.Application_Date, 30)
-
-    OR
-
-        tsys.OPEN_DT < app.Application_Date
-    AND tsys.OPEN_DT >= DATE_SUB(app.Application_Date, 7)
-  )
-
-  AND COALESCE(tsys.APPLID_SUF, '0') = '0'
-
-  AND tsys.STC_CR_REVOKED IS NULL
-
-  AND tsys.STC_CLOSE IS NULL
-
-  AND tsys.ACCT_NUM_TA1 IS NOT NULL
-
-  AND UPPER(tsys.Client_Product_Code) IN ('SMC', 'MBR');
-
-
--- ============================================================
--- 6. RETAIN NON-FRAUD/NON-SUSPICIOUS SMC/MBR CARDS
---
--- This is the same filter used in the original script before
--- checking action and match records.
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW smc_mbr_non_fraud_cards AS
-
-SELECT *
-
-FROM smc_mbr_cards
-
-WHERE Suspicious_Indicator = 0
-  AND Confirmed_Fraud_Indicator = 0;
-
-
--- ============================================================
--- 7. LATEST FRAUD ACTION PER APPLICATION
---
--- Equivalent to:
---   OUTER APPLY
---   SELECT TOP 1
---   ORDER BY date_updated DESC
---
--- Confirm the following action-table column names:
---   Application_Number
---   Action_Status_Code
---   Date_Updated
---   Start_Date
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW latest_fraud_action AS
-
-SELECT
-    Application_Number,
-    Action_Status_Code,
-    Date_Updated                          AS App_Fraud_Marked_Date,
-    Start_Date                            AS Fraud_Action_Start_Date
-
-FROM
-(
-    SELECT
-        CAST(Application_Number AS STRING)                AS Application_Number,
-        CAST(Action_Status_Code AS STRING)                AS Action_Status_Code,
-        TO_TIMESTAMP(Date_Updated)                        AS Date_Updated,
-        TO_DATE(Start_Date)                               AS Start_Date,
-
-        ROW_NUMBER() OVER
-        (
-            PARTITION BY Application_Number
-            ORDER BY TO_TIMESTAMP(Date_Updated) DESC
-        )                                                 AS Action_Row_Number
-
-    FROM hive_metastore.fiqm.tdct_rt_action
-
-    WHERE UPPER(Action_Status_Code) IN ('H', 'S')
-      AND TO_DATE(Date_Updated) >= DATE_SUB(CURRENT_DATE(), 7)
-) action_ranked
-
-WHERE Action_Row_Number = 1;
-
-
--- ============================================================
--- 8. APPLICATIONS ALREADY SENT TO ALERT QUEUE
---
--- Original logic:
---   Task name starts with MBNA
---   Exclude MBNA_CUETS RETRO
---   Created during the current extraction period
---
--- Confirm the match-table column names:
---   Application_Number
---   Task_Name
---   Create_Date_Time
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW existing_mbna_alerts AS
-
-SELECT DISTINCT
-    CAST(Application_Number AS STRING) AS Application_Number
-
-FROM hive_metastore.fiqm.tdct_rt_match
-
-WHERE UPPER(Task_Name) LIKE 'MBNA%'
-
-  AND UPPER(TRIM(Task_Name)) <> 'MBNA_CUETS RETRO'
-
-  AND TO_DATE(Create_Date_Time) >= DATE_SUB(CURRENT_DATE(), 7);
-
-
--- ============================================================
--- 9. FINAL SMC/MBR REPORT
---
--- Fraud_Tagged:
---   Yes when an H/S action exists
---   No otherwise
---
--- Excludes applications already in the MBNA alert queue.
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW smc_mbr_current AS
-
-SELECT DISTINCT
-    'SMC_MBR'                                             AS Report_Type,
-
-    cards.Application_Date,
-    cards.OPEN_DT,
-
-    cards.ACCT_NUM_TA1,
-    cards.Application_Number,
-    cards.Account_Number,
-
-    cards.Application_Name,
-    cards.Application_Name_Alternate,
-
-    cards.TSYS_Name,
-    cards.TSYS_Birth_Date,
-    cards.TSYS_Address,
-    cards.TSYS_City,
-    cards.TSYS_Province,
-    cards.TSYS_Postal_Code,
-
-    cards.Application_Address,
-    cards.Application_City,
-    cards.Application_Province,
-    cards.Application_Postal_Code,
-
-    cards.Employment_Income,
-
-    cards.Client_Product_Code,
-    cards.STATC_TIERED_AUTH,
-
-    cards.Suspicious_Indicator,
-    cards.Confirmed_Fraud_Indicator,
-
-    CASE
-        WHEN action.Action_Status_Code IS NOT NULL
-            THEN 'Yes'
-        ELSE 'No'
-    END                                                   AS Fraud_Tagged,
-
-    action.App_Fraud_Marked_Date,
-
-    0                                                     AS Alert_Indicator,
-
-    cards.Data_Source,
-    cards.Transit_Number,
-
-    CURRENT_TIMESTAMP()                                   AS Run_Timestamp,
-    CURRENT_DATE()                                        AS Run_Date
-
-FROM smc_mbr_non_fraud_cards cards
-
-LEFT JOIN latest_fraud_action action
-    ON action.Application_Number = cards.Application_Number
-
-LEFT JOIN existing_mbna_alerts alert
-    ON alert.Application_Number = cards.Application_Number
-
-WHERE alert.Application_Number IS NULL;
-
-
--- ============================================================
--- 10. COMBINE ADDRESS MISMATCH AND SMC/MBR
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW mbna_combined_current AS
-
-SELECT
-    Report_Type,
-    Application_Date,
-    OPEN_DT,
-    ACCT_NUM_TA1,
-    Application_Number,
-    Account_Number,
-    Application_Name,
-    Application_Name_Alternate,
-    TSYS_Name,
-    TSYS_Birth_Date,
-    TSYS_Address,
-    TSYS_City,
-    TSYS_Province,
-    TSYS_Postal_Code,
-    Application_Address,
-    Application_City,
-    Application_Province,
-    Application_Postal_Code,
-    Employment_Income,
-    Client_Product_Code,
-    STATC_TIERED_AUTH,
-    Suspicious_Indicator,
-    Confirmed_Fraud_Indicator,
-    Fraud_Tagged,
-    App_Fraud_Marked_Date,
-    Alert_Indicator,
-    Data_Source,
-    Transit_Number,
-    Run_Timestamp,
-    Run_Date
-
-FROM address_mismatch_current
-
-UNION ALL
-
-SELECT
-    Report_Type,
-    Application_Date,
-    OPEN_DT,
-    ACCT_NUM_TA1,
-    Application_Number,
-    Account_Number,
-    Application_Name,
-    Application_Name_Alternate,
-    TSYS_Name,
-    TSYS_Birth_Date,
-    TSYS_Address,
-    TSYS_City,
-    TSYS_Province,
-    TSYS_Postal_Code,
-    Application_Address,
-    Application_City,
-    Application_Province,
-    Application_Postal_Code,
-    Employment_Income,
-    Client_Product_Code,
-    STATC_TIERED_AUTH,
-    Suspicious_Indicator,
-    Confirmed_Fraud_Indicator,
-    Fraud_Tagged,
-    App_Fraud_Marked_Date,
-    Alert_Indicator,
-    Data_Source,
-    Transit_Number,
-    Run_Timestamp,
-    Run_Date
-
-FROM smc_mbr_current;
-
-
--- ============================================================
--- 11. REMOVE DUPLICATES WITHIN THE CURRENT RUN
---
--- One record per:
---   Report type
---   Application number
---   TSYS account number
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW mbna_combined_current_deduplicated AS
-
-SELECT
-    Report_Type,
-    Application_Date,
-    OPEN_DT,
-    ACCT_NUM_TA1,
-    Application_Number,
-    Account_Number,
-    Application_Name,
-    Application_Name_Alternate,
-    TSYS_Name,
-    TSYS_Birth_Date,
-    TSYS_Address,
-    TSYS_City,
-    TSYS_Province,
-    TSYS_Postal_Code,
-    Application_Address,
-    Application_City,
-    Application_Province,
-    Application_Postal_Code,
-    Employment_Income,
-    Client_Product_Code,
-    STATC_TIERED_AUTH,
-    Suspicious_Indicator,
-    Confirmed_Fraud_Indicator,
-    Fraud_Tagged,
-    App_Fraud_Marked_Date,
-    Alert_Indicator,
-    Data_Source,
-    Transit_Number,
-    Run_Timestamp,
-    Run_Date
-
-FROM
-(
-    SELECT
-        combined.*,
-
-        ROW_NUMBER() OVER
-        (
-            PARTITION BY
-                Report_Type,
-                Application_Number,
-                ACCT_NUM_TA1
-
-            ORDER BY
-                Application_Date DESC,
-                OPEN_DT DESC,
-                Run_Timestamp DESC
-        ) AS Duplicate_Row_Number
-
-    FROM mbna_combined_current combined
-) deduplicated
-
-WHERE Duplicate_Row_Number = 1;
-
-
--- =================================================================
--- 12. SELECT ONLY RECORDS NOT ALREADY IN HISTORY
---
--- Null-safe comparison is used for account number.
--- The same account can exist once under each Report_Type.
--- ============================================================
-
-CREATE OR REPLACE TEMP VIEW mbna_new_records AS
-
-SELECT current_data.*
-
-FROM mbna_combined_current_deduplicated current_data
-
-WHERE NOT EXISTS
-(
-    SELECT 1
-
-    FROM hive_metastore.fiqm.mbna_fraud_history_csv history
-
-    WHERE history.Report_Type = current_data.Report_Type
-
-      AND history.Application_Number
-          = current_data.Application_Number
-
-      AND COALESCE(history.ACCT_NUM_TA1, '')
-          = COALESCE(current_data.ACCT_NUM_TA1, '')
-);
-
-
--- ============================================================
--- 13. WRITE DAILY CSV
---
--- Data is stored under a Run_Date partition, for example:
---
--- daily/Run_Date=2026-07-31/
---
--- Running the script again on the same date replaces that
--- date's daily partition rather than creating duplicates.
--- ============================================================
-
-INSERT OVERWRITE TABLE hive_metastore.fiqm.mbna_fraud_daily_csv
-PARTITION (Run_Date)
-
-SELECT
-    Report_Type,
-    Application_Date,
-    OPEN_DT,
-    ACCT_NUM_TA1,
-    Application_Number,
-    Account_Number,
-    Application_Name,
-    Application_Name_Alternate,
-    TSYS_Name,
-    TSYS_Birth_Date,
-    TSYS_Address,
-    TSYS_City,
-    TSYS_Province,
-    TSYS_Postal_Code,
-    Application_Address,
-    Application_City,
-    Application_Province,
-    Application_Postal_Code,
-    Employment_Income,
-    Client_Product_Code,
-    STATC_TIERED_AUTH,
-    Suspicious_Indicator,
-    Confirmed_Fraud_Indicator,
-    Fraud_Tagged,
-    App_Fraud_Marked_Date,
-    Alert_Indicator,
-    Data_Source,
-    Transit_Number,
-    Run_Timestamp,
-    Run_Date
-
-FROM mbna_new_records;
-
-
--- ============================================================
--- 14. APPEND NEW RECORDS TO COMBINED HISTORICAL CSV
--- ============================================================
-
-INSERT INTO hive_metastore.fiqm.mbna_fraud_history_csv
-
-SELECT
-    Report_Type,
-    Application_Date,
-    OPEN_DT,
-    ACCT_NUM_TA1,
-    Application_Number,
-    Account_Number,
-    Application_Name,
-    Application_Name_Alternate,
-    TSYS_Name,
-    TSYS_Birth_Date,
-    TSYS_Address,
-    TSYS_City,
-    TSYS_Province,
-    TSYS_Postal_Code,
-    Application_Address,
-    Application_City,
-    Application_Province,
-    Application_Postal_Code,
-    Employment_Income,
-    Client_Product_Code,
-    STATC_TIERED_AUTH,
-    Suspicious_Indicator,
-    Confirmed_Fraud_Indicator,
-    Fraud_Tagged,
-    App_Fraud_Marked_Date,
-    Alert_Indicator,
-    Data_Source,
-    Transit_Number,
-    Run_Timestamp,
-    Run_Date
-
-FROM mbna_new_records;
-
-
--- ============================================================
--- 15. RUN SUMMARY
--- ============================================================
-
-SELECT
-    CURRENT_DATE()                                        AS Run_Date,
-    Report_Type,
-
-    COUNT(*)                                              AS New_Record_Count,
-
-    COUNT(DISTINCT Application_Number)                    AS New_Application_Count,
-
-    COUNT(DISTINCT ACCT_NUM_TA1)                          AS New_Account_Count,
-
-    SUM(
-        COALESCE(Suspicious_Indicator, 0)
-    )                                                     AS Suspicious_Record_Count,
-
-    SUM(
-        COALESCE(Confirmed_Fraud_Indicator, 0)
-    )                                                     AS Confirmed_Fraud_Record_Count,
-
-    SUM(
-        CASE
-            WHEN Fraud_Tagged = 'Yes' THEN 1
-            ELSE 0
-        END
-    )                                                     AS Fraud_Tagged_Record_Count
-
-FROM mbna_new_records
-
-GROUP BY Report_Type
-
-ORDER BY Report_Type;
+        .reset_index()
+        .sort_values(group_column)
+    )
+
+
+# Daily performance
+kpi_df_daily = create_kpi_report(
+    MBNA_blocks_hist_status,
+    "Run_Day"
+)
+
+# Weekly performance
+kpi_df_weekly = create_kpi_report(
+    MBNA_blocks_hist_status,
+    "Run_Week"
+)
+
+# Add week-end date for reporting
+kpi_df_weekly["Week_End"] = (
+    kpi_df_weekly["Run_Week"] + pd.Timedelta(days=6)
+)
+
+# Reorder weekly columns
+kpi_df_weekly = kpi_df_weekly[
+    [
+        "Run_Week",
+        "Week_End",
+        "num_blocked",
+        "num_still_blocked",
+        "num_marked_fraud",
+        "num_unblocked"
+    ]
+]
+
+# Monthly performance
+kpi_df_monthly = create_kpi_report(
+    MBNA_blocks_hist_status,
+    "Run_Month"
+)
+
+print("Daily Performance")
+display(kpi_df_daily)
+
+print("Weekly Performance")
+display(kpi_df_weekly)
+
+print("Monthly Performance")
+display(kpi_df_monthly)
