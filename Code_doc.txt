@@ -1,105 +1,95 @@
 import pandas as pd
+from pathlib import Path
 
-# Ensure Run_Date is datetime
-MBNA_blocks_hist_status["Run_Date"] = pd.to_datetime(
-    MBNA_blocks_hist_status["Run_Date"],
-    errors="coerce"
+# ---------------------------------------------------------
+# 1. File paths
+# ---------------------------------------------------------
+Funnel_path = Path(
+    r"\\nabdc01sdprs01\c05173_share_s_01\TOR1\Retail Fraud Strategic Analytics\...\funnel_file.csv"
 )
 
-# Daily, weekly and monthly reporting fields
-MBNA_blocks_hist_status["Run_Day"] = (
-    MBNA_blocks_hist_status["Run_Date"].dt.normalize()
+FIQ_Data_path = Path(
+    r"\\nabdc01sdprs01\c05173_share_s_01\TOR1\Retail Fraud Strategic Analytics\...\fiq_data_file.csv"
 )
 
-# Monday as the start of the week
-MBNA_blocks_hist_status["Run_Week"] = (
-    MBNA_blocks_hist_status["Run_Date"]
-    .dt.to_period("W-SUN")
-    .dt.start_time
+# ---------------------------------------------------------
+# 2. Read Funnel and FIQ files
+# ---------------------------------------------------------
+funnel_df = pd.read_csv(
+    Funnel_path,
+    dtype=str,
+    low_memory=False
 )
 
-# Keep year and month together so different years are not combined
-MBNA_blocks_hist_status["Run_Month"] = (
-    MBNA_blocks_hist_status["Run_Date"]
-    .dt.to_period("M")
-    .astype(str)
+fiq_df = pd.read_csv(
+    FIQ_Data_path,
+    dtype=str,
+    low_memory=False
 )
 
-# Create conditional account-number columns
-MBNA_blocks_hist_status["acct_still_blocked"] = (
-    MBNA_blocks_hist_status["ACCT_NUM_TA1"]
-    .where(MBNA_blocks_hist_status["susp_ind_base"].eq(1))
+# Remove extra spaces from column names
+funnel_df.columns = funnel_df.columns.str.strip()
+fiq_df.columns = fiq_df.columns.str.strip()
+final_df_v1.columns = final_df_v1.columns.str.strip()
+
+# ---------------------------------------------------------
+# 3. Define join columns
+# ---------------------------------------------------------
+# Change these based on the actual column names in the files.
+funnel_fiq_join_key = "Application_ID"
+
+# Column used to join final_df_v1 to the Funnel + FIQ dataset
+final_join_key = "Application_ID"
+
+# ---------------------------------------------------------
+# 4. Avoid duplicate records before joining
+# ---------------------------------------------------------
+# Use this only if one application should have one FIQ record.
+fiq_df = fiq_df.drop_duplicates(
+    subset=[funnel_fiq_join_key],
+    keep="last"
 )
 
-MBNA_blocks_hist_status["acct_marked_fraud"] = (
-    MBNA_blocks_hist_status["ACCT_NUM_TA1"].where(
-        MBNA_blocks_hist_status["susp_ind_base"].eq(0)
-        & MBNA_blocks_hist_status["Cnf_fraud_ind"].eq(1)
-    )
+# ---------------------------------------------------------
+# 5. Left join all FIQ columns to Funnel
+# ---------------------------------------------------------
+funnel_fiq_df = funnel_df.merge(
+    fiq_df,                              # All FIQ columns are included
+    on=funnel_fiq_join_key,
+    how="left",
+    suffixes=("_funnel", "_fiq"),
+    validate="m:1"                       # Many funnel rows to one FIQ row
 )
 
-MBNA_blocks_hist_status["acct_unblocked"] = (
-    MBNA_blocks_hist_status["ACCT_NUM_TA1"].where(
-        MBNA_blocks_hist_status["susp_ind_base"].eq(0)
-        & MBNA_blocks_hist_status["Cnf_fraud_ind"].eq(0)
-    )
+# ---------------------------------------------------------
+# 6. Prepare final_df_v1
+# ---------------------------------------------------------
+# Use this if final_df_v1 should contain one row per application.
+final_df_v1 = final_df_v1.drop_duplicates(
+    subset=[final_join_key],
+    keep="last"
 )
 
-
-def create_kpi_report(df, group_column):
-    return (
-        df.groupby(group_column, dropna=False)
-        .agg(
-            num_blocked=("ACCT_NUM_TA1", "nunique"),
-            num_still_blocked=("acct_still_blocked", "nunique"),
-            num_marked_fraud=("acct_marked_fraud", "nunique"),
-            num_unblocked=("acct_unblocked", "nunique")
-        )
-        .reset_index()
-        .sort_values(group_column)
-    )
-
-
-# Daily performance
-kpi_df_daily = create_kpi_report(
-    MBNA_blocks_hist_status,
-    "Run_Day"
+# ---------------------------------------------------------
+# 7. Use Funnel + FIQ as the main/base dataframe and
+#    left join final_df_v1
+# ---------------------------------------------------------
+final_merged_df = funnel_fiq_df.merge(
+    final_df_v1,
+    on=final_join_key,
+    how="left",
+    suffixes=("", "_final"),
+    validate="m:1"
 )
 
-# Weekly performance
-kpi_df_weekly = create_kpi_report(
-    MBNA_blocks_hist_status,
-    "Run_Week"
-)
+# ---------------------------------------------------------
+# 8. Optional cleanup
+# ---------------------------------------------------------
+final_merged_df.drop_duplicates(inplace=True)
+final_merged_df.reset_index(drop=True, inplace=True)
 
-# Add week-end date for reporting
-kpi_df_weekly["Week_End"] = (
-    kpi_df_weekly["Run_Week"] + pd.Timedelta(days=6)
-)
-
-# Reorder weekly columns
-kpi_df_weekly = kpi_df_weekly[
-    [
-        "Run_Week",
-        "Week_End",
-        "num_blocked",
-        "num_still_blocked",
-        "num_marked_fraud",
-        "num_unblocked"
-    ]
-]
-
-# Monthly performance
-kpi_df_monthly = create_kpi_report(
-    MBNA_blocks_hist_status,
-    "Run_Month"
-)
-
-print("Daily Performance")
-display(kpi_df_daily)
-
-print("Weekly Performance")
-display(kpi_df_weekly)
-
-print("Monthly Performance")
-display(kpi_df_monthly)
+print("Funnel rows:", len(funnel_df))
+print("FIQ rows:", len(fiq_df))
+print("Funnel + FIQ rows:", len(funnel_fiq_df))
+print("Final merged rows:", len(final_merged_df))
+print("Final columns:", len(final_merged_df.columns))
