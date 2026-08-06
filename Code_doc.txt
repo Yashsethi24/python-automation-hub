@@ -1,95 +1,191 @@
 import pandas as pd
-from pathlib import Path
 
-# ---------------------------------------------------------
-# 1. File paths
-# ---------------------------------------------------------
-Funnel_path = Path(
-    r"\\nabdc01sdprs01\c05173_share_s_01\TOR1\Retail Fraud Strategic Analytics\...\funnel_file.csv"
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+
+
+# ============================================================
+# 1. Configuration
+# ============================================================
+
+TARGET_COLUMN = "fraud_ind"
+
+# Numeric columns with this many unique values or fewer
+# will be treated as categorical.
+LOW_CARDINALITY_THRESHOLD = 10
+
+# Add columns here that should not be used as model features.
+EXCLUDE_COLUMNS = [
+    # "application_number",
+    # "customer_id",
+]
+
+
+# ============================================================
+# 2. Separate features and target
+# ============================================================
+
+columns_to_drop = [TARGET_COLUMN] + EXCLUDE_COLUMNS
+
+X = df.drop(
+    columns=[col for col in columns_to_drop if col in df.columns]
+).copy()
+
+y = df[TARGET_COLUMN].copy()
+
+
+# ============================================================
+# 3. Dynamically identify numerical and categorical columns
+# ============================================================
+
+numerical_columns = []
+categorical_columns = []
+
+for column in X.columns:
+
+    unique_count = X[column].nunique(dropna=True)
+
+    if pd.api.types.is_numeric_dtype(X[column]):
+
+        if unique_count <= LOW_CARDINALITY_THRESHOLD:
+            categorical_columns.append(column)
+        else:
+            numerical_columns.append(column)
+
+    else:
+        categorical_columns.append(column)
+
+
+print(f"Total feature columns: {X.shape[1]}")
+print(f"Numerical columns: {len(numerical_columns)}")
+print(f"Categorical columns: {len(categorical_columns)}")
+
+print("\nNumerical columns:")
+print(numerical_columns)
+
+print("\nCategorical columns:")
+print(categorical_columns)
+
+
+# ============================================================
+# 4. Convert categorical columns to a consistent datatype
+# ============================================================
+
+# This avoids errors when a categorical column contains a mixture
+# of numbers, strings and null values.
+for column in categorical_columns:
+    X[column] = X[column].astype("string")
+
+
+# ============================================================
+# 5. Define preprocessing pipelines
+# ============================================================
+
+numerical_pipeline = Pipeline(
+    steps=[
+        (
+            "numerical_imputer",
+            SimpleImputer(
+                strategy="constant",
+                fill_value=-1
+            )
+        )
+    ]
 )
 
-FIQ_Data_path = Path(
-    r"\\nabdc01sdprs01\c05173_share_s_01\TOR1\Retail Fraud Strategic Analytics\...\fiq_data_file.csv"
+
+categorical_pipeline = Pipeline(
+    steps=[
+        (
+            "categorical_imputer",
+            SimpleImputer(
+                strategy="constant",
+                fill_value="Unknown"
+            )
+        ),
+        (
+            "one_hot_encoder",
+            OneHotEncoder(
+                handle_unknown="ignore",
+                sparse_output=True
+            )
+        )
+    ]
 )
 
-# ---------------------------------------------------------
-# 2. Read Funnel and FIQ files
-# ---------------------------------------------------------
-funnel_df = pd.read_csv(
-    Funnel_path,
-    dtype=str,
-    low_memory=False
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        (
+            "numerical",
+            numerical_pipeline,
+            numerical_columns
+        ),
+        (
+            "categorical",
+            categorical_pipeline,
+            categorical_columns
+        )
+    ],
+    remainder="drop"
 )
 
-fiq_df = pd.read_csv(
-    FIQ_Data_path,
-    dtype=str,
-    low_memory=False
+
+# ============================================================
+# 6. Create decision-tree pipeline
+# ============================================================
+
+model_pipeline = Pipeline(
+    steps=[
+        ("preprocessing", preprocessor),
+        (
+            "decision_tree",
+            DecisionTreeClassifier(
+                max_depth=6,
+                min_samples_leaf=50,
+                class_weight="balanced",
+                random_state=42
+            )
+        )
+    ]
 )
 
-# Remove extra spaces from column names
-funnel_df.columns = funnel_df.columns.str.strip()
-fiq_df.columns = fiq_df.columns.str.strip()
-final_df_v1.columns = final_df_v1.columns.str.strip()
 
-# ---------------------------------------------------------
-# 3. Define join columns
-# ---------------------------------------------------------
-# Change these based on the actual column names in the files.
-funnel_fiq_join_key = "Application_ID"
+# ============================================================
+# 7. Train-test split
+# ============================================================
 
-# Column used to join final_df_v1 to the Funnel + FIQ dataset
-final_join_key = "Application_ID"
-
-# ---------------------------------------------------------
-# 4. Avoid duplicate records before joining
-# ---------------------------------------------------------
-# Use this only if one application should have one FIQ record.
-fiq_df = fiq_df.drop_duplicates(
-    subset=[funnel_fiq_join_key],
-    keep="last"
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.20,
+    random_state=42,
+    stratify=y
 )
 
-# ---------------------------------------------------------
-# 5. Left join all FIQ columns to Funnel
-# ---------------------------------------------------------
-funnel_fiq_df = funnel_df.merge(
-    fiq_df,                              # All FIQ columns are included
-    on=funnel_fiq_join_key,
-    how="left",
-    suffixes=("_funnel", "_fiq"),
-    validate="m:1"                       # Many funnel rows to one FIQ row
+
+# ============================================================
+# 8. Train model
+# ============================================================
+
+model_pipeline.fit(X_train, y_train)
+
+
+# ============================================================
+# 9. Evaluate model
+# ============================================================
+
+predictions = model_pipeline.predict(X_test)
+
+print(
+    classification_report(
+        y_test,
+        predictions,
+        zero_division=0
+    )
 )
-
-# ---------------------------------------------------------
-# 6. Prepare final_df_v1
-# ---------------------------------------------------------
-# Use this if final_df_v1 should contain one row per application.
-final_df_v1 = final_df_v1.drop_duplicates(
-    subset=[final_join_key],
-    keep="last"
-)
-
-# ---------------------------------------------------------
-# 7. Use Funnel + FIQ as the main/base dataframe and
-#    left join final_df_v1
-# ---------------------------------------------------------
-final_merged_df = funnel_fiq_df.merge(
-    final_df_v1,
-    on=final_join_key,
-    how="left",
-    suffixes=("", "_final"),
-    validate="m:1"
-)
-
-# ---------------------------------------------------------
-# 8. Optional cleanup
-# ---------------------------------------------------------
-final_merged_df.drop_duplicates(inplace=True)
-final_merged_df.reset_index(drop=True, inplace=True)
-
-print("Funnel rows:", len(funnel_df))
-print("FIQ rows:", len(fiq_df))
-print("Funnel + FIQ rows:", len(funnel_fiq_df))
-print("Final merged rows:", len(final_merged_df))
-print("Final columns:", len(final_merged_df.columns))
